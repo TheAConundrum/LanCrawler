@@ -1,0 +1,27 @@
+﻿# Local Excel / data — keep out of Cursor index & context
+*.xlsm
+*.xlsx
+*.xls
+*.xlsb
+!Blank_LAN_Crawler Tool.xlsm
+LAN Search Tool.xlsm
+**/LAN Search Tool.xlsm
+
+crawl_output/
+ExcelFiles/
+*.csv
+*.sqlite
+*.db
+
+venv/
+.venv/
+env/
+Archives/
+__pycache__/
+
+.env
+.env.*
+credentials.json
+**/secrets/
+
+agent-transcripts/

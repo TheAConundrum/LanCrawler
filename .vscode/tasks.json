@@ -1,0 +1,89 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Import VBA code to Excel",
+            "dependsOn": [
+                "1. Run Python Inject"
+            ],
+            "dependsOrder": "sequence",
+            "group": "build",
+            "problemMatcher": [],
+            "detail": "Import VBA — freezes Excel UI, injects src/vba, reopens once for cache warm."
+        },
+        {
+            "label": "Export from Excel to Disk",
+            "dependsOn": [
+                "2. Run xlwings Export"
+            ],
+            "dependsOrder": "sequence",
+            "group": "build",
+            "problemMatcher": [],
+            "detail": "Export from Excel to Disk — backs up workbook VBA into src/vba."
+        },
+        {
+            "label": "Crawl LAN folder (picker)",
+            "type": "shell",
+            "command": "${command:python.interpreterPath}",
+            "args": [
+                "${workspaceFolder}\\src\\crawler\\run_crawl.py"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}\\src"
+            },
+            "problemMatcher": [],
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": true,
+                "panel": "dedicated",
+                "showReuseMessage": false,
+                "clear": true
+            },
+            "detail": "Folder picker → parallel crawl → auto-import Excel (freeze/write/reopen for cache warm)."
+        },
+        {
+            "label": "1. Run Python Inject",
+            "type": "shell",
+            "command": "${command:python.interpreterPath}",
+            "args": [
+                "${workspaceFolder}\\src\\inject_vba.py",
+                "${workspaceFolder}\\Blank_LAN_Crawler Tool.xlsm"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": [],
+            "presentation": {
+                "echo": false,
+                "reveal": "silent",
+                "focus": false,
+                "panel": "shared",
+                "showReuseMessage": false,
+                "clear": true
+            }
+        },
+        {
+            "label": "2. Run xlwings Export",
+            "type": "shell",
+            "command": "powershell",
+            "args": [
+                "-NoProfile",
+                "-Command",
+                "& { echo y | & '${command:python.interpreterPath}' -m xlwings vba export --file '${workspaceFolder}\\Blank_LAN_Crawler Tool.xlsm' }"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}/src/vba"
+            },
+            "problemMatcher": [],
+            "presentation": {
+                "echo": false,
+                "reveal": "silent",
+                "focus": false,
+                "panel": "shared",
+                "showReuseMessage": false,
+                "clear": true
+            }
+        }
+    ]
+}

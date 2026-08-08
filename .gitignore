@@ -1,0 +1,55 @@
+# --- Secrets / local Excel (never push live workbooks) ---
+*.xlsx
+*.xls
+*.xlsb
+*.xltm
+*.xltx
+*.xlsm
+# Allowed blank template only (repo root)
+!/Blank_LAN_Crawler Tool.xlsm
+
+# Explicit block of the live tool workbook (any path)
+LAN Search Tool.xlsm
+**/LAN Search Tool.xlsm
+
+# --- Crawl / runtime output ---
+crawl_output/
+ExcelFiles/
+*.csv
+*.sqlite
+*.db
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+env/
+Archives/
+
+# --- Env / credentials ---
+.env
+.env.*
+!.env.example
+credentials.json
+**/secrets/
+
+# --- IDE / OS ---
+.vscode/*
+!.vscode/tasks.json
+!.vscode/extensions.json
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Cursor / agent noise ---
+.cursor/
+agent-transcripts/
+*.canvas.tsx

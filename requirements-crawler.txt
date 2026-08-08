@@ -1,0 +1,2 @@
+# Optional deps for crawler Excel import (crawl itself is stdlib-only).
+xlwings>=0.30.0
