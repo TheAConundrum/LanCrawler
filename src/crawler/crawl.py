@@ -7,13 +7,17 @@ from __future__ import annotations
 import csv
 import datetime as dt
 import os
-import sqlite3
 import sys
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
+
+# Exclusive AccDB target beside the workbook: {workbook_dir}\DB\LAN_Search_Index.accdb
+ACCDB_DIR_NAME = "DB"
+ACCDB_FILE_NAME = "LAN_Search_Index.accdb"
+ACCDB_ROW_THRESHOLD = 750_000
 
 try:
     from .filters import (
@@ -301,28 +305,139 @@ def write_csv(rows: list[IndexRow], out_path: Path) -> None:
             w.writerow([r.path, r.file_date, f"{r.size_mb:.2f}", r.entry_type])
 
 
-def write_sqlite(rows: list[IndexRow], out_path: Path) -> None:
+def accdb_path_for_workbook(workbook: str | Path) -> Path:
+    """Relative AccDB beside the workbook: {wb_dir}\\DB\\LAN_Search_Index.accdb."""
+    return Path(workbook).resolve().parent / ACCDB_DIR_NAME / ACCDB_FILE_NAME
+
+
+def _create_empty_accdb(out_path: Path) -> None:
+    """Create a blank .accdb via ACE/ADOX (pyodbc cannot create empty AccDB files)."""
+    out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     if out_path.exists():
         out_path.unlink()
-    conn = sqlite3.connect(str(out_path))
+
+    providers = (
+        "Microsoft.ACE.OLEDB.16.0",
+        "Microsoft.ACE.OLEDB.12.0",
+    )
+    last_err: Exception | None = None
     try:
-        conn.execute(
+        import win32com.client  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError(
+            "Creating AccDB requires pywin32 (win32com). Install: pip install pywin32"
+        ) from exc
+
+    for provider in providers:
+        try:
+            cat = win32com.client.Dispatch("ADOX.Catalog")
+            cat.Create(f"Provider={provider};Data Source={out_path};")
+            try:
+                cat.ActiveConnection.Close()
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        except Exception as exc:  # noqa: BLE001
+            last_err = exc
+            if out_path.exists():
+                try:
+                    out_path.unlink()
+                except OSError:
+                    pass
+
+    raise RuntimeError(
+        "Could not create AccDB via ADOX. Install Microsoft Access Database Engine (ACE) "
+        f"matching Office bitness. Last error: {last_err}"
+    ) from last_err
+
+
+def _accdb_connection_strings(out_path: Path) -> list[str]:
+    path = str(Path(out_path).resolve())
+    return [
+        (
+            r"DRIVER={Microsoft Access Driver (*.mdb, *.accdb)};"
+            f"DBQ={path};"
+        ),
+        f"Provider=Microsoft.ACE.OLEDB.16.0;Data Source={path};",
+        f"Provider=Microsoft.ACE.OLEDB.12.0;Data Source={path};",
+    ]
+
+
+def write_accdb(rows: list[IndexRow], out_path: Path) -> None:
+    """Write IndexRow data to Access .accdb (tblFiles + indexes). Creates file if missing."""
+    try:
+        import pyodbc  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError(
+            "Writing AccDB requires pyodbc. Install: pip install pyodbc"
+        ) from exc
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Rebuild cleanly: recreate file then bulk insert (avoids stale schema / locks when possible)
+    if out_path.exists():
+        try:
+            out_path.unlink()
+        except OSError:
+            # File locked — drop table in place instead
+            pass
+
+    if not out_path.exists():
+        _create_empty_accdb(out_path)
+
+    conn = None
+    last_err: Exception | None = None
+    for conn_str in _accdb_connection_strings(out_path):
+        try:
+            conn = pyodbc.connect(conn_str, autocommit=False)
+            break
+        except Exception as exc:  # noqa: BLE001
+            last_err = exc
+    if conn is None:
+        raise RuntimeError(
+            "Could not open AccDB with pyodbc. Install Microsoft Access Database Engine (ACE) "
+            f"and the Access ODBC driver. Last error: {last_err}"
+        ) from last_err
+
+    try:
+        cur = conn.cursor()
+        try:
+            cur.execute("DROP TABLE tblFiles")
+            conn.commit()
+        except Exception:  # noqa: BLE001
+            conn.rollback()
+
+        cur.execute(
             """
             CREATE TABLE tblFiles (
                 FilePath TEXT NOT NULL,
                 FileDate TEXT,
-                SizeMB REAL NOT NULL,
+                SizeMB DOUBLE NOT NULL,
                 EntryType TEXT NOT NULL
             )
             """
         )
-        conn.executemany(
-            "INSERT INTO tblFiles (FilePath, FileDate, SizeMB, EntryType) VALUES (?, ?, ?, ?)",
-            [(r.path, r.file_date or None, r.size_mb, r.entry_type) for r in rows],
+        conn.commit()
+
+        insert_sql = (
+            "INSERT INTO tblFiles (FilePath, FileDate, SizeMB, EntryType) VALUES (?, ?, ?, ?)"
         )
-        conn.execute("CREATE INDEX ix_tblFiles_path ON tblFiles(FilePath)")
-        conn.execute("CREATE INDEX ix_tblFiles_type ON tblFiles(EntryType)")
+        batch: list[tuple[str, str | None, float, str]] = []
+        batch_size = 500
+        for r in rows:
+            batch.append((r.path, r.file_date or None, float(r.size_mb), r.entry_type))
+            if len(batch) >= batch_size:
+                cur.executemany(insert_sql, batch)
+                conn.commit()
+                batch.clear()
+        if batch:
+            cur.executemany(insert_sql, batch)
+            conn.commit()
+
+        cur.execute("CREATE INDEX ix_tblFiles_path ON tblFiles (FilePath)")
+        cur.execute("CREATE INDEX ix_tblFiles_type ON tblFiles (EntryType)")
         conn.commit()
     finally:
         conn.close()
@@ -392,13 +507,37 @@ def pick_folder(title: str = "Select a folder to crawl (LAN Search Tool)") -> st
     return path or ""
 
 
+def pick_workbook(
+    title: str = "Select workbook to update",
+    initial_dir: str | Path | None = None,
+) -> str:
+    """Open a file dialog for an .xlsm workbook. Returns path or '' if cancelled."""
+    import tkinter as tk
+    from tkinter import filedialog
+
+    start = Path(initial_dir) if initial_dir else Path(__file__).resolve().parent.parent.parent
+    win = tk.Tk()
+    win.withdraw()
+    try:
+        win.attributes("-topmost", True)
+        win.lift()
+        win.focus_force()
+    except tk.TclError:
+        pass
+    path = filedialog.askopenfilename(
+        title=title,
+        initialdir=str(start),
+        filetypes=[
+            ("Excel Macro-Enabled Workbook", "*.xlsm"),
+            ("All files", "*.*"),
+        ],
+    )
+    win.destroy()
+    return path or ""
+
+
 def _default_out_dir() -> Path:
     return Path(__file__).resolve().parent.parent.parent / "crawl_output"
-
-
-def _default_workbook() -> Path | None:
-    wb = Path(__file__).resolve().parent.parent.parent / "Blank_LAN_Crawler Tool.xlsm"
-    return wb if wb.exists() else None
 
 
 def run_interactive(
@@ -406,9 +545,11 @@ def run_interactive(
     workers: int = 16,
     progress_every: int = 50,
     auto_import_excel: bool = True,
+    workbook: str | Path | None = None,
+    target_mode: str | None = None,
+    use_gui: bool = True,
 ) -> int:
-    """Folder-picker entry: crawl → CSV → auto-import Excel (no prompts after pick)."""
-    # Force UTF-8-friendly console where possible; avoid fancy punctuation either way
+    """GUI/CLI entry: crawl → Auto/Workbook/AccDB exclusive index write."""
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
@@ -416,22 +557,69 @@ def run_interactive(
         pass
 
     print("LAN Search Tool - parallel crawler", flush=True)
-    print("Opening folder picker (check the taskbar if you do not see it)...", flush=True)
-    root = pick_folder()
-    if not root:
-        print("Cancelled - no folder selected.", flush=True)
-        return 0
+
+    root = ""
+    wb_path: Path | None = None
+    mode = (target_mode or "Auto").strip() or "Auto"
+    if mode not in ("Auto", "Workbook", "AccDB"):
+        mode = "Auto"
+
+    if use_gui and workbook is None and target_mode is None:
+        try:
+            from .crawl_gui import run_crawl_gui
+        except ImportError:
+            from crawler.crawl_gui import run_crawl_gui  # type: ignore
+
+        gui = run_crawl_gui(initial_workbook=workbook)
+        if gui.cancelled:
+            print("Cancelled.", flush=True)
+            return 0
+        root = gui.root
+        wb_path = Path(gui.workbook)
+        mode = gui.target_mode
+    else:
+        print("Opening folder picker (check the taskbar if you do not see it)...", flush=True)
+        root = pick_folder()
+        if not root:
+            print("Cancelled - no folder selected.", flush=True)
+            return 0
+
+        if workbook is not None and str(workbook).strip():
+            wb_path = Path(workbook)
+        elif auto_import_excel:
+            print("Opening workbook picker (select the .xlsm to update)...", flush=True)
+            chosen = pick_workbook(
+                initial_dir=Path(__file__).resolve().parent.parent.parent,
+                title="Select AccDB / LAN Search workbook",
+            )
+            if not chosen:
+                print("Cancelled - no workbook selected.", flush=True)
+                return 0
+            wb_path = Path(chosen)
+        else:
+            print("No workbook selected; AccDB/Excel write skipped.", flush=True)
+            wb_path = None
+
+    if wb_path is not None and not wb_path.is_file():
+        print(f"Workbook not found: {wb_path}", flush=True)
+        return 1
 
     out_dir = _default_out_dir()
     stamp = time.strftime("%Y%m%d_%H%M%S")
     csv_path = out_dir / f"{stamp}_tblFiles.csv"
+    accdb_out = accdb_path_for_workbook(wb_path) if wb_path is not None else None
 
     drive_map = build_drive_map([root])
     unc = to_unc_path(root, drive_map, "")
     print(f"Root:    {root}", flush=True)
     print(f"UNC:     {unc}", flush=True)
     print(f"Workers: {workers}", flush=True)
+    print(f"Mode:    {mode}", flush=True)
     print(f"CSV:     {csv_path}", flush=True)
+    if wb_path is not None:
+        print(f"Excel:   {wb_path}", flush=True)
+    if accdb_out is not None:
+        print(f"AccDB:   {accdb_out}", flush=True)
     print("---", flush=True)
 
     def on_progress(msg: str) -> None:
@@ -455,32 +643,59 @@ def run_interactive(
         flush=True,
     )
 
-    if not auto_import_excel:
+    if wb_path is None:
         return 0
 
-    wb = _default_workbook()
-    if wb is None:
-        print("No Blank_LAN_Crawler Tool.xlsm found next to crawl_output — CSV only.", flush=True)
-        return 0
+    force_accdb = mode == "AccDB" or len(rows) > ACCDB_ROW_THRESHOLD
+    if mode == "Workbook" and len(rows) > ACCDB_ROW_THRESHOLD:
+        force_accdb = True
+        print(
+            f"Row count {len(rows):,} exceeds {ACCDB_ROW_THRESHOLD:,}; "
+            "forcing AccDB write for performance.",
+            flush=True,
+        )
+    elif mode == "Auto" and len(rows) > ACCDB_ROW_THRESHOLD:
+        force_accdb = True
+        print(
+            f"Auto mode: {len(rows):,} rows > {ACCDB_ROW_THRESHOLD:,} → AccDB.",
+            flush=True,
+        )
 
     try:
-        try:
-            from .import_to_excel import import_csv_to_workbook
-        except ImportError:
-            from crawler.import_to_excel import import_csv_to_workbook  # type: ignore
+        if force_accdb:
+            assert accdb_out is not None
+            print(f"Writing AccDB -> {accdb_out} ...", flush=True)
+            write_accdb(rows, accdb_out)
+            print(f"Wrote AccDB ({len(rows):,} rows).", flush=True)
+            try:
+                from .import_to_excel import clear_onboard_tblfiles
+            except ImportError:
+                from crawler.import_to_excel import clear_onboard_tblfiles  # type: ignore
 
-        print(f"Importing (ReplaceRoot) into {wb} ...", flush=True)
-        total = import_csv_to_workbook(
-            workbook=wb,
-            csv_path=csv_path,
-            mode="ReplaceRoot",
-            unc_root=unc,
-        )
-        print(f"Excel import complete ({total:,} rows in tblFiles).", flush=True)
+            print("Clearing onboard Database!tblFiles so AccDB is exclusive...", flush=True)
+            clear_onboard_tblfiles(wb_path)
+            print(
+                f"Index deployed to AccDB:\n  {accdb_out}\n"
+                "Onboard sheet database was cleared. Re-open the workbook to search AccDB.",
+                flush=True,
+            )
+        else:
+            try:
+                from .import_to_excel import import_csv_to_workbook
+            except ImportError:
+                from crawler.import_to_excel import import_csv_to_workbook  # type: ignore
+
+            print(f"Importing (ReplaceRoot) into workbook {wb_path} ...", flush=True)
+            total = import_csv_to_workbook(
+                workbook=wb_path,
+                csv_path=csv_path,
+                mode="ReplaceRoot",
+                unc_root=unc,
+            )
+            print(f"Excel import complete ({total:,} rows in tblFiles).", flush=True)
     except Exception as exc:  # noqa: BLE001
-        print(f"Excel import failed: {exc}", flush=True)
-        print("CSV is still saved - you can import later with:", flush=True)
-        print(f'  python -m crawler "{root}" --import-excel "{wb}"', flush=True)
+        print(f"Index write failed: {exc}", flush=True)
+        print("CSV is still saved.", flush=True)
         return 1
 
     return 0

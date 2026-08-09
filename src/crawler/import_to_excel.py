@@ -535,3 +535,137 @@ def import_csv_to_workbook(
                         app.api.EnableEvents = True
                     except Exception:
                         pass
+
+
+def clear_onboard_tblfiles(
+    workbook: Path,
+    *,
+    sheet_name: str = "Database",
+    table_name: str = "tblFiles",
+) -> None:
+    """
+    Empty Database!tblFiles so AccDB can be the exclusive session backend.
+    Required after AccDB writes so leftover sheet rows cannot shadow AccDB on load.
+    """
+    import xlwings as xw
+
+    workbook = Path(workbook)
+    if not workbook.exists():
+        raise FileNotFoundError(workbook)
+
+    saved_path = str(workbook.resolve())
+    host_app = _close_target_if_open(workbook)
+    app = host_app
+    we_started_app = False
+    if app is None:
+        app = xw.App(visible=True, add_book=False)
+        we_started_app = True
+
+    wb = None
+    try:
+        app.visible = True
+        app.screen_updating = False
+        app.display_alerts = False
+        try:
+            app.enable_events = False
+        except Exception:
+            try:
+                app.api.EnableEvents = False
+            except Exception:
+                pass
+
+        wb = app.books.open(saved_path)
+        try:
+            ws = wb.sheets[sheet_name]
+        except Exception as exc:
+            raise RuntimeError(f"Sheet '{sheet_name}' not found") from exc
+
+        try:
+            ws.api.Visible = -1  # xlSheetVisible
+        except Exception:
+            pass
+        try:
+            ws.api.Unprotect(Password="")
+        except Exception:
+            try:
+                ws.api.Unprotect()
+            except Exception:
+                pass
+
+        last_row = _sheet_used_last_row(ws, 1)
+        for tbl in list(ws.tables):
+            if tbl.name == table_name:
+                tbl.api.Delete()
+
+        if last_row >= 2:
+            ws.range((2, 1), (last_row, 4)).clear_contents()
+
+        ws.range("A1").value = [["FilePath", "FileDate", "SizeMB", "EntryType"]]
+        # Keep a valid empty ListObject (header + one blank row then delete body pattern)
+        ws.range((2, 1)).value = [["", None, None, ""]]
+        tbl_range = ws.range((1, 1), (2, 4))
+        ws.tables.add(source=tbl_range, name=table_name)
+        try:
+            ws.tables[table_name].api.ListRows(1).Delete()
+        except Exception:
+            # If delete fails, clear the blank row contents
+            ws.range((2, 1), (2, 4)).clear_contents()
+
+        try:
+            wb.sheets["Dashboard"].api.Unprotect(Password="")
+        except Exception:
+            try:
+                wb.sheets["Dashboard"].api.Unprotect()
+            except Exception:
+                pass
+
+        enforce_workbook_ui_lock(wb)
+        wb.save()
+        print(f"Cleared onboard {table_name} in {wb.name} (AccDB is exclusive index).", flush=True)
+
+        try:
+            wb.close()
+        except Exception:
+            pass
+        wb = None
+
+        try:
+            app.screen_updating = True
+            app.display_alerts = True
+            app.enable_events = True
+        except Exception:
+            try:
+                app.api.EnableEvents = True
+            except Exception:
+                pass
+
+        # Leave Excel as we found it; reopen briefly so UI lock / open state is consistent
+        wb = app.books.open(saved_path)
+        try:
+            wb.activate()
+        except Exception:
+            pass
+        app = None
+    finally:
+        if app is not None:
+            try:
+                if wb is not None:
+                    wb.close()
+            except Exception:
+                pass
+            if we_started_app:
+                try:
+                    if len(app.books) == 0:
+                        app.quit()
+                except Exception:
+                    pass
+            else:
+                try:
+                    app.screen_updating = True
+                    app.display_alerts = True
+                    app.enable_events = True
+                except Exception:
+                    try:
+                        app.api.EnableEvents = True
+                    except Exception:
+                        pass

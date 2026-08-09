@@ -4,6 +4,7 @@
 *.xls
 *.xlsb
 !Blank_LAN_Crawler Tool.xlsm
+!AccDB-Blank_LAN_Crawler Tool.xlsm
 LAN Search Tool.xlsm
 **/LAN Search Tool.xlsm
 
@@ -12,6 +13,9 @@ ExcelFiles/
 *.csv
 *.sqlite
 *.db
+*.accdb
+*.laccdb
+DB/
 
 venv/
 .venv/

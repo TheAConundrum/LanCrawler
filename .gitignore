@@ -5,8 +5,9 @@
 *.xltm
 *.xltx
 *.xlsm
-# Allowed blank template only (repo root)
+# Allowed blank templates only (repo root)
 !/Blank_LAN_Crawler Tool.xlsm
+!/AccDB-Blank_LAN_Crawler Tool.xlsm
 
 # Explicit block of the live tool workbook (any path)
 LAN Search Tool.xlsm
@@ -18,6 +19,9 @@ ExcelFiles/
 *.csv
 *.sqlite
 *.db
+*.accdb
+*.laccdb
+DB/
 
 # --- Python ---
 __pycache__/

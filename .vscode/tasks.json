@@ -9,7 +9,7 @@
             "dependsOrder": "sequence",
             "group": "build",
             "problemMatcher": [],
-            "detail": "Import VBA — freezes Excel UI, injects src/vba, reopens once for cache warm."
+            "detail": "Import VBA into AccDB-Blank_LAN_Crawler Tool.xlsm (Crawlerv2 AccDB workbook)."
         },
         {
             "label": "Export from Excel to Disk",
@@ -19,7 +19,7 @@
             "dependsOrder": "sequence",
             "group": "build",
             "problemMatcher": [],
-            "detail": "Export from Excel to Disk — backs up workbook VBA into src/vba."
+            "detail": "Export VBA from AccDB-Blank workbook into src/vba."
         },
         {
             "label": "Crawl LAN folder (picker)",
@@ -40,7 +40,7 @@
                 "showReuseMessage": false,
                 "clear": true
             },
-            "detail": "Folder picker → parallel crawl → auto-import Excel (freeze/write/reopen for cache warm)."
+            "detail": "Crawl GUI → folder + AccDB-Blank workbook + Auto/Workbook/AccDB → exclusive index write."
         },
         {
             "label": "1. Run Python Inject",
@@ -48,7 +48,7 @@
             "command": "${command:python.interpreterPath}",
             "args": [
                 "${workspaceFolder}\\src\\inject_vba.py",
-                "${workspaceFolder}\\Blank_LAN_Crawler Tool.xlsm"
+                "${workspaceFolder}\\AccDB-Blank_LAN_Crawler Tool.xlsm"
             ],
             "options": {
                 "cwd": "${workspaceFolder}"
@@ -70,7 +70,7 @@
             "args": [
                 "-NoProfile",
                 "-Command",
-                "& { echo y | & '${command:python.interpreterPath}' -m xlwings vba export --file '${workspaceFolder}\\Blank_LAN_Crawler Tool.xlsm' }"
+                "& { echo y | & '${command:python.interpreterPath}' -m xlwings vba export --file '${workspaceFolder}\\AccDB-Blank_LAN_Crawler Tool.xlsm' }"
             ],
             "options": {
                 "cwd": "${workspaceFolder}/src/vba"

@@ -410,10 +410,15 @@ Public Sub EnsureResultsDisplayGrid()
     End With
     ws.Range(ws.Cells(firstRow, RESULTS_TYPE_COL), ws.Cells(lastRow, RESULTS_TYPE_COL)).HorizontalAlignment = xlCenter
 
-    ' File column looks clickable (actual open is double-click → hidden UNC col)
+    ' File column looks clickable (actual open is double-click → hidden UNC col).
+    ' Folder/Drive are display-only — never hyperlink-blue (clears leftover link styling).
     With ws.Range(ws.Cells(firstRow, RESULTS_FILE_COL), ws.Cells(lastRow, RESULTS_FILE_COL))
         .Font.Color = RGB(5, 99, 193)
         .Font.Underline = xlUnderlineStyleSingle
+    End With
+    With ws.Range(ws.Cells(firstRow, RESULTS_DRIVE_COL), ws.Cells(lastRow, RESULTS_FOLDER_COL_END))
+        .Font.ColorIndex = xlColorIndexAutomatic
+        .Font.Underline = xlUnderlineStyleNone
     End With
 
     EnsureLinkColumnHidden ws
@@ -462,7 +467,7 @@ Private Sub UnprotectSheet(ByVal ws As Worksheet)
     On Error GoTo 0
 End Sub
 
-' Full UI lock: only Key Word + Size MB cells editable on Dashboard.
+' Full UI lock: free-text Key Word + Size MB; dropdowns unlocked for list pick only.
 ' Ingestion locked; Database protected + xlSheetVeryHidden.
 ' VBA ingestion/search still works via UnprotectWorkbookForWrite / UserInterfaceOnly.
 Public Sub ProtectDashboardResults()
@@ -470,10 +475,38 @@ Public Sub ProtectDashboardResults()
 End Sub
 
 Public Sub ProtectWorkbookUi()
+    Dim was As Worksheet
+    On Error Resume Next
+    Set was = mWorkbook.ActiveSheet
+    On Error GoTo 0
+
     ProtectDashboardSheet
     ProtectIngestionSheet
     ProtectAndHideDatabase
-    Debug.Print "INDEX CACHE: workbook UI locked (keywords+MB only; Database very hidden)"
+
+    ' Locking other sheets can steal focus (often lands on Ingestion) — restore prior visible sheet.
+    On Error Resume Next
+    If Not was Is Nothing Then
+        If was.Visible = xlSheetVisible Then was.Activate
+    End If
+    On Error GoTo 0
+    Debug.Print "INDEX CACHE: workbook UI locked (keywords+MB+dropdowns; Database very hidden)"
+End Sub
+
+' After search: stay on Dashboard and show results start. Does NOT touch FreezePanes.
+Public Sub FocusDashboardResultsHome()
+    Dim ws As Worksheet
+    Dim screenPrev As Boolean
+
+    On Error Resume Next
+    Set ws = Dashboard
+    If ws Is Nothing Then Exit Sub
+    screenPrev = Application.ScreenUpdating
+    Application.ScreenUpdating = False
+    ws.Activate
+    Application.Goto Reference:=ws.Range("A8"), Scroll:=True
+    Application.ScreenUpdating = screenPrev
+    On Error GoTo 0
 End Sub
 
 Private Sub ProtectDashboardSheet()
@@ -486,18 +519,34 @@ Private Sub ProtectDashboardSheet()
     On Error Resume Next
 
     ws.Cells.Locked = True
-    ' Free-text search only: Key Word 1, Key Word 2, Size MB (not ops / options / drive)
+    ' Free-text: Key Word 1, Key Word 2, Size MB
     ws.Range(ws.Cells(CRITERIA_FIRST_ROW, CRITERIA_COL_TERM1), _
              ws.Cells(CRITERIA_LAST_ROW, CRITERIA_COL_TERM1)).Locked = False
     ws.Range(ws.Cells(CRITERIA_FIRST_ROW, CRITERIA_COL_TERM2), _
              ws.Cells(CRITERIA_LAST_ROW, CRITERIA_COL_TERM2)).Locked = False
     ws.Range(ws.Cells(CRITERIA_FIRST_ROW, CRITERIA_COL_SIZE_MB), _
              ws.Cells(CRITERIA_LAST_ROW, CRITERIA_COL_SIZE_MB)).Locked = False
+    ' Dropdowns (select-only via validation Stop): AND/OR/NOT, Size <>, Flexible, Folders, Drive
+    ws.Range(ws.Cells(CRITERIA_FIRST_ROW, CRITERIA_COL_OP), _
+             ws.Cells(CRITERIA_LAST_ROW, CRITERIA_COL_OP)).Locked = False
+    ws.Range(ws.Cells(CRITERIA_FIRST_ROW, CRITERIA_COL_SIZE_OP), _
+             ws.Cells(CRITERIA_LAST_ROW, CRITERIA_COL_SIZE_OP)).Locked = False
+    ws.Range(ADDR_FLEXIBLE_MATCH).Locked = False
+    ws.Range(ADDR_SEARCH_FOLDERS).Locked = False
+    ws.Range(ADDR_DRIVE_FILTER).Locked = False
     ' Hidden UNC targets must be readable while sheet is protected
     ws.Columns(RESULTS_LINK_COL).Locked = False
     EnsureLinkColumnHidden ws
 
-    ApplySheetProtect ws
+    ApplyCriteriaOperatorValidation
+    ApplyOptionDropdownValidation
+
+    ' Excel cannot lock individual column widths; allow resize sheet-wide, then
+    ' pin A:F / H:J / L:N back to the widths captured on first lock this session.
+    CaptureDashboardFixedColumnWidthsIfNeeded ws
+    RestoreDashboardFixedColumnWidths ws
+
+    ApplySheetProtect ws, True
     ws.EnableSelection = xlNoRestrictions
     On Error GoTo 0
 End Sub
@@ -509,7 +558,7 @@ Private Sub ProtectIngestionSheet()
     UnprotectSheet ws
     On Error Resume Next
     ws.Cells.Locked = True
-    ApplySheetProtect ws
+    ApplySheetProtect ws, False
     ws.EnableSelection = xlNoRestrictions
     On Error GoTo 0
 End Sub
@@ -521,13 +570,13 @@ Private Sub ProtectAndHideDatabase()
     UnprotectSheet ws
     On Error Resume Next
     ws.Cells.Locked = True
-    ApplySheetProtect ws
+    ApplySheetProtect ws, False
     ws.EnableSelection = xlNoRestrictions
     ws.Visible = xlSheetVeryHidden ' 2 — not listed in Unhide UI
     On Error GoTo 0
 End Sub
 
-Private Sub ApplySheetProtect(ByVal ws As Worksheet)
+Private Sub ApplySheetProtect(ByVal ws As Worksheet, Optional ByVal allowFormattingColumns As Boolean = False)
     If ws Is Nothing Then Exit Sub
     On Error Resume Next
     ws.Protect Password:=vbNullString, _
@@ -536,7 +585,7 @@ Private Sub ApplySheetProtect(ByVal ws As Worksheet)
                Scenarios:=True, _
                UserInterfaceOnly:=True, _
                AllowFormattingCells:=False, _
-               AllowFormattingColumns:=False, _
+               AllowFormattingColumns:=allowFormattingColumns, _
                AllowFormattingRows:=False, _
                AllowInsertingColumns:=False, _
                AllowInsertingRows:=False, _
@@ -546,6 +595,36 @@ Private Sub ApplySheetProtect(ByVal ws As Worksheet)
                AllowSorting:=False, _
                AllowFiltering:=False, _
                AllowUsingPivotTables:=False
+    On Error GoTo 0
+End Sub
+
+' Fixed chrome columns (not user-resizable): A:F, H:J, L:N
+Public Sub CaptureDashboardFixedColumnWidthsIfNeeded(ByVal ws As Worksheet)
+    Dim c As Variant
+    If ws Is Nothing Then Exit Sub
+    If modEntryPoints.DashboardFixedWidthsReady Then Exit Sub
+    On Error Resume Next
+    For Each c In Array(1, 2, 3, 4, 5, 6, 8, 9, 10, 12, 13, 14)
+        modEntryPoints.SetDashboardFixedWidth CLng(c), CDbl(ws.Columns(CLng(c)).ColumnWidth)
+    Next c
+    modEntryPoints.DashboardFixedWidthsReady = True
+    On Error GoTo 0
+End Sub
+
+Public Sub RestoreDashboardFixedColumnWidths(ByVal ws As Worksheet)
+    Dim c As Variant
+    Dim w As Double
+    If ws Is Nothing Then Exit Sub
+    If Not modEntryPoints.DashboardFixedWidthsReady Then Exit Sub
+    On Error Resume Next
+    For Each c In Array(1, 2, 3, 4, 5, 6, 8, 9, 10, 12, 13, 14)
+        w = modEntryPoints.GetDashboardFixedWidth(CLng(c))
+        If w > 0 Then
+            If Abs(ws.Columns(CLng(c)).ColumnWidth - w) > 0.05 Then
+                ws.Columns(CLng(c)).ColumnWidth = w
+            End If
+        End If
+    Next c
     On Error GoTo 0
 End Sub
 
@@ -600,8 +679,10 @@ Public Sub ApplyCriteriaOperatorValidation()
         .InCellDropdown = True
         .InputTitle = "Operator"
         .InputMessage = "Blank = first keyword only. AND/OR/NOT joins Key Word columns on this row."
-        .ShowInput = True
+        .ShowInput = False
         .ShowError = True
+        .ErrorTitle = "Operator"
+        .ErrorMessage = "Pick AND, OR, or NOT from the list (or leave blank)."
     End With
 
     Set rngSize = Dashboard.Range(Dashboard.Cells(CRITERIA_FIRST_ROW, CRITERIA_COL_SIZE_OP), _
@@ -616,8 +697,47 @@ Public Sub ApplyCriteriaOperatorValidation()
         .InCellDropdown = True
         .InputTitle = "Size"
         .InputMessage = "Optional. Use with Size (MB): e.g. > and 2 means larger than 2 MB."
-        .ShowInput = True
+        .ShowInput = False
         .ShowError = True
+        .ErrorTitle = "Size operator"
+        .ErrorMessage = "Pick < or > from the list (or leave blank)."
+    End With
+End Sub
+
+' Flexible match / Search folders — list pick only (Stop blocks free typing).
+Public Sub ApplyOptionDropdownValidation()
+    Dim rng As Range
+
+    On Error Resume Next
+    Set rng = Dashboard.Range(ADDR_FLEXIBLE_MATCH)
+    If rng.MergeCells Then Set rng = rng.MergeArea.Cells(1, 1)
+    rng.Validation.Delete
+    On Error GoTo 0
+    With rng.Validation
+        .Add Type:=xlValidateList, AlertStyle:=xlValidAlertStop, Operator:=xlBetween, _
+             Formula1:="Yes,No"
+        .IgnoreBlank = True
+        .InCellDropdown = True
+        .ShowInput = False
+        .ShowError = True
+        .ErrorTitle = "Flexible match"
+        .ErrorMessage = "Pick Yes or No from the list."
+    End With
+
+    On Error Resume Next
+    Set rng = Dashboard.Range(ADDR_SEARCH_FOLDERS)
+    If rng.MergeCells Then Set rng = rng.MergeArea.Cells(1, 1)
+    rng.Validation.Delete
+    On Error GoTo 0
+    With rng.Validation
+        .Add Type:=xlValidateList, AlertStyle:=xlValidAlertStop, Operator:=xlBetween, _
+             Formula1:="Yes,No,Only"
+        .IgnoreBlank = True
+        .InCellDropdown = True
+        .ShowInput = False
+        .ShowError = True
+        .ErrorTitle = "Search folders"
+        .ErrorMessage = "Pick Yes, No, or Only from the list."
     End With
 End Sub
 

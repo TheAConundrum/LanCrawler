@@ -2,52 +2,51 @@ Attribute VB_Name = "modIndexCache"
 Option Explicit
 Option Private Module
 
-' Workbook-lifetime cache of Database!tblFiles for search.
-' Loaded on first search; seeded/replaced after a successful ingest write;
-' cleared when the index is emptied. Lives until the workbook closes.
-'
-' Parallel search arrays (path/name/flex/folder/size/date) are built once on load
-' so each search avoids re-parsing rows and re-normalizing names.
+' Exclusive session index backend:
+'   Sheet  — onboard Database!tblFiles is non-empty (used for the whole session)
+'   AccDB  — sheet empty and {workbook}\DB\LAN_Search_Index.accdb exists
+'   Empty  — neither available
+' No hybrid merge. Resolve once on warm / EnsureResolved.
 
 Private Const SHEET_DATABASE As String = "Database"
 Private Const TABLE_FILES As String = "tblFiles"
+Private Const ACCDB_DIR As String = "DB"
+Private Const ACCDB_FILE As String = "LAN_Search_Index.accdb"
 
+Public Const BACKEND_EMPTY As String = "Empty"
+Public Const BACKEND_SHEET As String = "Sheet"
+Public Const BACKEND_ACCDB As String = "AccDB"
+
+Private mBackend As String
+Private mResolved As Boolean
+Private mWorkbookPath As String
+
+' Slim sheet cache (FilePath-based search only — no parent/descendant arrays)
 Private mData As Variant
 Private mRowCount As Long
-Private mLoaded As Boolean
+Private mSheetLoaded As Boolean
 
-' Parallel search arrays (1-based), built with mData
-Private mPath() As String
-Private mName() As String
-Private mNameFlex() As String
-Private mIsFolder() As Boolean
-Private mSizeMb() As Double
-Private mDate() As Variant
-Private mParentIdx() As Long          ' immediate parent FOLDER row index (0 = none)
-Private mDescFileCount() As Long      ' indexed files under folder (recursive)
-Private mDescFolderCount() As Long    ' indexed subfolders under folder (recursive)
-Private mDescIndexedSize() As Double  ' sum of indexed file SizeMB under folder (legacy fallback)
-Private mFolderRowByPath As Object    ' Scripting.Dictionary: folder UNC -> row index
-Private mShareRoot() As String        ' UNC share root per row (\\server\share)
 Private mDriveByLabel As Object       ' Scripting.Dictionary: friendly label -> share UNC
 Private mLabelByShare As Object       ' Scripting.Dictionary: share UNC -> friendly label
-Private mExtrasReady As Boolean
 
-' Last GetIndexData / LoadFromDatabase diagnostics (seconds)
 Private mLastGetWasHit As Boolean
 Private mLastGetSeconds As Double
 Private mLastLoadSeconds As Double
 
+Public Function CurrentBackend() As String
+    If Not mResolved Then
+        CurrentBackend = BACKEND_EMPTY
+    Else
+        CurrentBackend = mBackend
+    End If
+End Function
+
 Public Function IsIndexLoaded() As Boolean
-    IsIndexLoaded = mLoaded
+    IsIndexLoaded = mResolved And (mBackend <> BACKEND_EMPTY)
 End Function
 
 Public Function IndexRowCount() As Long
-    If Not mLoaded Then
-        IndexRowCount = 0
-    Else
-        IndexRowCount = mRowCount
-    End If
+    IndexRowCount = mRowCount
 End Function
 
 Public Function LastGetWasCacheHit() As Boolean
@@ -62,56 +61,168 @@ Public Function LastLoadSeconds() As Double
     LastLoadSeconds = mLastLoadSeconds
 End Function
 
-' Ensure cache is loaded (no array copy). Prefer this for search.
+Public Function AccdbPath(Optional ByVal wb As Workbook = Nothing) As String
+    Dim base As String
+    If wb Is Nothing Then Set wb = ActiveWorkbook
+    If wb Is Nothing Then
+        AccdbPath = vbNullString
+        Exit Function
+    End If
+    base = Trim$(wb.Path)
+    If Len(base) = 0 Then
+        AccdbPath = vbNullString
+        Exit Function
+    End If
+    AccdbPath = base & "\" & ACCDB_DIR & "\" & ACCDB_FILE
+End Function
+
+Public Function AccdbExists(Optional ByVal wb As Workbook = Nothing) As Boolean
+    Dim p As String
+    p = AccdbPath(wb)
+    If Len(p) = 0 Then
+        AccdbExists = False
+        Exit Function
+    End If
+    AccdbExists = (Len(Dir$(p)) > 0)
+End Function
+
+' Late-bound ACE connection to the AccDB beside the workbook.
+Public Function OpenIndexConnection(Optional ByVal wb As Workbook = Nothing) As Object
+    Dim cn As Object
+    Dim p As String
+    Dim errMsg As String
+
+    p = AccdbPath(wb)
+    If Len(p) = 0 Then
+        Err.Raise vbObjectError + 100, "modIndexCache", _
+                  "Workbook must be saved before opening AccDB (wb.Path is empty)."
+    End If
+    If Len(Dir$(p)) = 0 Then
+        Err.Raise vbObjectError + 101, "modIndexCache", "AccDB not found: " & p
+    End If
+
+    Set cn = CreateObject("ADODB.Connection")
+    On Error Resume Next
+    cn.Open "Provider=Microsoft.ACE.OLEDB.16.0;Data Source=" & p & ";"
+    If Err.Number <> 0 Then
+        errMsg = Err.Description
+        Err.Clear
+        cn.Open "Provider=Microsoft.ACE.OLEDB.12.0;Data Source=" & p & ";"
+    End If
+    If Err.Number <> 0 Then
+        errMsg = Err.Description
+        On Error GoTo 0
+        Err.Raise vbObjectError + 102, "modIndexCache", _
+                  "Could not open AccDB (install ACE matching Office bitness): " & errMsg
+    End If
+    On Error GoTo 0
+    Set OpenIndexConnection = cn
+End Function
+
+Public Function SheetTblFilesNonEmpty(Optional ByVal wb As Workbook = Nothing) As Boolean
+    Dim ws As Worksheet
+    Dim tbl As ListObject
+
+    SheetTblFilesNonEmpty = False
+    If wb Is Nothing Then Set wb = ActiveWorkbook
+    If wb Is Nothing Then Exit Function
+
+    On Error Resume Next
+    Set ws = wb.Worksheets(SHEET_DATABASE)
+    If ws Is Nothing Then Exit Function
+    Set tbl = ws.ListObjects(TABLE_FILES)
+    On Error GoTo 0
+    If tbl Is Nothing Then Exit Function
+    If tbl.DataBodyRange Is Nothing Then Exit Function
+    If tbl.ListRows.Count <= 0 Then Exit Function
+
+    ' Treat a single blank FilePath row as empty
+    If tbl.ListRows.Count = 1 Then
+        If Len(Trim$(CStr(tbl.DataBodyRange.Cells(1, 1).Value2 & ""))) = 0 Then Exit Function
+    End If
+    SheetTblFilesNonEmpty = True
+End Function
+
+' Resolve exclusive backend once per session (or after Invalidate / SetIndexData).
+Public Sub ResolveIndexBackend(Optional ByVal wb As Workbook = Nothing)
+    Dim t0 As Double
+    t0 = Timer
+    mLastGetWasHit = mResolved
+
+    If wb Is Nothing Then Set wb = ActiveWorkbook
+    If wb Is Nothing Then
+        InvalidateIndex
+        mLastLoadSeconds = ElapsedSeconds(t0)
+        Exit Sub
+    End If
+
+    If mResolved And Len(mWorkbookPath) > 0 Then
+        If StrComp(mWorkbookPath, wb.FullName, vbTextCompare) = 0 Then
+            mLastGetSeconds = ElapsedSeconds(t0)
+            RefreshDashboardDriveList wb
+            Exit Sub
+        End If
+    End If
+
+    InvalidateIndex
+    mWorkbookPath = wb.FullName
+
+    If SheetTblFilesNonEmpty(wb) Then
+        mBackend = BACKEND_SHEET
+        LoadSheetSlim wb
+        BuildDriveMapsFromSheet
+        mResolved = True
+        mLastLoadSeconds = ElapsedSeconds(t0)
+        Debug.Print "INDEX: ResolveIndexBackend=Sheet rows=" & CStr(mRowCount) & _
+                    " " & FormatSeconds(mLastLoadSeconds)
+        RefreshDashboardDriveList wb
+        Exit Sub
+    End If
+
+    If AccdbExists(wb) Then
+        mBackend = BACKEND_ACCDB
+        mRowCount = AccdbRowCount(wb)
+        mSheetLoaded = False
+        mData = Empty
+        BuildDriveMapsFromAccdb wb
+        mResolved = True
+        mLastLoadSeconds = ElapsedSeconds(t0)
+        Debug.Print "INDEX: ResolveIndexBackend=AccDB rows=" & CStr(mRowCount) & _
+                    " " & FormatSeconds(mLastLoadSeconds)
+        RefreshDashboardDriveList wb
+        Exit Sub
+    End If
+
+    mBackend = BACKEND_EMPTY
+    mResolved = True
+    mRowCount = 0
+    mLastLoadSeconds = ElapsedSeconds(t0)
+    Debug.Print "INDEX: ResolveIndexBackend=Empty " & FormatSeconds(mLastLoadSeconds)
+    RefreshDashboardDriveList wb
+End Sub
+
 Public Sub EnsureLoaded(Optional ByVal wb As Workbook = Nothing)
     Dim t0 As Double
     t0 = Timer
-    mLastGetWasHit = mLoaded
-    If Not mLoaded Then
-        LoadFromDatabase wb
-        mLastGetSeconds = ElapsedSeconds(t0)
-        Debug.Print "INDEX CACHE: EnsureLoaded MISS rows=" & CStr(mRowCount) & _
-                    " " & FormatSeconds(mLastGetSeconds)
+    mLastGetWasHit = mResolved And (mBackend <> BACKEND_EMPTY)
+    If Not mResolved Then
+        ResolveIndexBackend wb
     Else
-        mLastGetSeconds = ElapsedSeconds(t0)
-        Debug.Print "INDEX CACHE: EnsureLoaded HIT rows=" & CStr(mRowCount) & _
-                    " " & FormatSeconds(mLastGetSeconds)
-        ' Keep drive dropdown in sync even on cache hits
         RefreshDashboardDriveList wb
     End If
+    mLastGetSeconds = ElapsedSeconds(t0)
 End Sub
 
-' Returns cached rows (1-based 2D). Loads from Database sheet on first use.
-' Note: assigning the Variant return value copies the array — prefer EnsureLoaded + CollectNameHits.
-Public Function GetIndexData(ByRef rowCount As Long) As Variant
-    Dim t0 As Double
-    Dim wasLoaded As Boolean
-
-    t0 = Timer
-    wasLoaded = mLoaded
-    mLastGetWasHit = mLoaded
-
-    If Not mLoaded Then LoadFromDatabase ActiveWorkbook
-
-    rowCount = mRowCount
-    If mRowCount = 0 Then
-        GetIndexData = Empty
-    Else
-        GetIndexData = mData
+Public Sub WarmIndexIfNeeded(Optional ByVal wb As Workbook = Nothing)
+    If mResolved Then
+        Debug.Print "INDEX: already resolved backend=" & mBackend & " rows=" & CStr(mRowCount)
+        Exit Sub
     End If
+    Debug.Print "INDEX: WarmIndexIfNeeded resolving backend..."
+    ResolveIndexBackend wb
+End Sub
 
-    mLastGetSeconds = ElapsedSeconds(t0)
-    If wasLoaded Then
-        Debug.Print "INDEX CACHE: GetIndexData HIT rows=" & CStr(mRowCount) & _
-                    " copy+return=" & FormatSeconds(mLastGetSeconds)
-    Else
-        Debug.Print "INDEX CACHE: GetIndexData MISS (loaded) rows=" & CStr(mRowCount) & _
-                    " load=" & FormatSeconds(mLastLoadSeconds) & _
-                    " getTotal=" & FormatSeconds(mLastGetSeconds)
-    End If
-End Function
-
-' Replace cache with a full index array (e.g. after ingest write).
+' Seed sheet backend after VBA ingest write.
 Public Sub SetIndexData(ByRef source As Variant, ByVal rowCount As Long)
     Dim t0 As Double
     If rowCount <= 0 Or Not IsArray(source) Then
@@ -120,182 +231,56 @@ Public Sub SetIndexData(ByRef source As Variant, ByVal rowCount As Long)
     End If
     mData = source
     mRowCount = rowCount
-    mLoaded = True
+    mSheetLoaded = True
+    mBackend = BACKEND_SHEET
+    mResolved = True
     mLastLoadSeconds = 0
     t0 = Timer
-    BuildSearchExtras
-    Debug.Print "INDEX CACHE: set from ingest/array rows=" & CStr(mRowCount) & _
-                " extras=" & FormatSeconds(ElapsedSeconds(t0))
+    BuildDriveMapsFromSheet
+    Debug.Print "INDEX: SetIndexData Sheet rows=" & CStr(mRowCount) & _
+                " drives=" & FormatSeconds(ElapsedSeconds(t0))
+    RefreshDashboardDriveList ActiveWorkbook
 End Sub
 
 Public Sub InvalidateIndex()
     On Error Resume Next
     Erase mData
-    Erase mPath
-    Erase mName
-    Erase mNameFlex
-    Erase mIsFolder
-    Erase mSizeMb
-    Erase mDate
-    Erase mParentIdx
-    Erase mDescFileCount
-    Erase mDescFolderCount
-    Erase mDescIndexedSize
-    Erase mShareRoot
-    Set mFolderRowByPath = Nothing
     Set mDriveByLabel = Nothing
     Set mLabelByShare = Nothing
     On Error GoTo 0
     mData = Empty
     mRowCount = 0
-    mLoaded = False
-    mExtrasReady = False
-    Debug.Print "INDEX CACHE: invalidated"
-    ' Do not refresh drive dropdown here — BuildSearchExtras does it after drives are known.
+    mSheetLoaded = False
+    mResolved = False
+    mBackend = BACKEND_EMPTY
+    mWorkbookPath = vbNullString
+    Debug.Print "INDEX: invalidated"
 End Sub
 
-Public Sub LoadFromDatabase(Optional ByVal wb As Workbook = Nothing)
-    Dim ws As Worksheet
-    Dim tbl As ListObject
-    Dim data As Variant
-    Dim n As Long
-    Dim cols As Long
-    Dim r As Long
-    Dim normalized() As Variant
-    Dim t0 As Double
-    Dim tRead As Double
-    Dim tNorm As Double
-    Dim tExtras As Double
-    Dim secRead As Double
-    Dim secNorm As Double
-    Dim secExtras As Double
-
-    t0 = Timer
-    InvalidateIndex
-
-    If wb Is Nothing Then Set wb = ActiveWorkbook
-    If wb Is Nothing Then
-        mLastLoadSeconds = ElapsedSeconds(t0)
-        Debug.Print "INDEX CACHE: LoadFromDatabase aborted (no workbook) " & FormatSeconds(mLastLoadSeconds)
-        Exit Sub
-    End If
-
-    On Error Resume Next
-    Set ws = wb.Worksheets(SHEET_DATABASE)
-    If ws Is Nothing Then
-        mLastLoadSeconds = ElapsedSeconds(t0)
-        Debug.Print "INDEX CACHE: LoadFromDatabase aborted (no Database sheet) " & FormatSeconds(mLastLoadSeconds)
-        Exit Sub
-    End If
-    Set tbl = ws.ListObjects(TABLE_FILES)
-    On Error GoTo 0
-
-    If tbl Is Nothing Then
-        mLastLoadSeconds = ElapsedSeconds(t0)
-        Debug.Print "INDEX CACHE: LoadFromDatabase aborted (no tblFiles) " & FormatSeconds(mLastLoadSeconds)
-        Exit Sub
-    End If
-    If tbl.DataBodyRange Is Nothing Then
-        mLastLoadSeconds = ElapsedSeconds(t0)
-        Debug.Print "INDEX CACHE: LoadFromDatabase empty table " & FormatSeconds(mLastLoadSeconds)
-        Exit Sub
-    End If
-    If tbl.ListRows.Count = 0 Then
-        mLastLoadSeconds = ElapsedSeconds(t0)
-        Debug.Print "INDEX CACHE: LoadFromDatabase 0 rows " & FormatSeconds(mLastLoadSeconds)
-        Exit Sub
-    End If
-
-    On Error Resume Next
-    Application.StatusBar = "LAN Search: loading index cache..."
-    On Error GoTo 0
-
-    tRead = Timer
-    data = tbl.DataBodyRange.Value
-    secRead = ElapsedSeconds(tRead)
-
-    If Not IsArray(data) Then
-        ClearAppStatusBar
-        mLastLoadSeconds = ElapsedSeconds(t0)
-        Debug.Print "INDEX CACHE: LoadFromDatabase non-array body " & FormatSeconds(mLastLoadSeconds)
-        Exit Sub
-    End If
-
-    n = UBound(data, 1)
-    cols = UBound(data, 2)
-
-    tNorm = Timer
-    ReDim normalized(1 To n, 1 To 4)
-    For r = 1 To n
-        normalized(r, 1) = data(r, 1)
-        If cols >= 2 Then normalized(r, 2) = data(r, 2) Else normalized(r, 2) = Empty
-        If cols >= 3 Then normalized(r, 3) = data(r, 3) Else normalized(r, 3) = 0.01
-        If cols >= 4 And Len(Trim$(CStr(data(r, 4) & ""))) > 0 Then
-            normalized(r, 4) = UCase$(Trim$(CStr(data(r, 4))))
-        Else
-            normalized(r, 4) = "FILE"
-        End If
-        If r Mod 2500 = 0 Then DoEvents
-    Next r
-    secNorm = ElapsedSeconds(tNorm)
-
-    mData = normalized
-    mRowCount = n
-    mLoaded = True
-
-    tExtras = Timer
-    BuildSearchExtras
-    secExtras = ElapsedSeconds(tExtras)
-
-    mLastLoadSeconds = ElapsedSeconds(t0)
-
-    Debug.Print "INDEX CACHE: LoadFromDatabase rows=" & CStr(mRowCount) & _
-                " sheetRead=" & FormatSeconds(secRead) & _
-                " normalize=" & FormatSeconds(secNorm) & _
-                " searchExtras=" & FormatSeconds(secExtras) & _
-                " total=" & FormatSeconds(mLastLoadSeconds)
-
-    ClearAppStatusBar
-End Sub
-
-Private Sub ClearAppStatusBar()
-    On Error Resume Next
-    Application.DisplayStatusBar = True
-    Application.StatusBar = vbNullString
-    Application.StatusBar = False
-    On Error GoTo 0
-End Sub
-
-' No-op if already warm (used by deferred Workbook_Open load).
-Public Sub WarmIndexIfNeeded(Optional ByVal wb As Workbook = Nothing)
-    If mLoaded Then
-        Debug.Print "INDEX CACHE: already warm rows=" & CStr(mRowCount)
-        Exit Sub
-    End If
-    Debug.Print "INDEX CACHE: WarmIndexIfNeeded starting load..."
-    LoadFromDatabase wb
-End Sub
-
-' Fast name scan against precomputed arrays (no Variant array copy).
-' shareFilter: UNC share root to restrict (empty = All drives).
-Public Sub CollectNameHits(ByVal term1 As String, ByVal op As String, ByVal term2 As String, _
+' Slim path/LIKE-equivalent scan of onboard sheet cache.
+Public Sub CollectPathHits(ByVal term1 As String, ByVal op As String, ByVal term2 As String, _
                            ByVal flexible As Boolean, _
                            ByVal includeFiles As Boolean, ByVal includeFolders As Boolean, _
                            ByVal hasSizeFilter As Boolean, ByVal sizeOp As String, ByVal sizeMb As Double, _
-                           ByVal hits As Object, ByVal folderHits As Object, _
+                           ByVal hits As Object, _
                            Optional ByVal shareFilter As String = "")
     Dim i As Long
+    Dim path As String
+    Dim et As String
+    Dim isFolder As Boolean
+    Dim sizeVal As Double
+    Dim dt As Variant
     Dim term1N As String
     Dim term2N As String
+    Dim hay As String
     Dim hasTerm2 As Boolean
-    Dim matched As Boolean
     Dim has1 As Boolean
     Dim has2 As Boolean
-    Dim hay As String
+    Dim matched As Boolean
     Dim filterShare As String
+    Dim share As String
 
-    If Not mLoaded Or mRowCount = 0 Then Exit Sub
-    If Not mExtrasReady Then BuildSearchExtras
+    If mBackend <> BACKEND_SHEET Or Not mSheetLoaded Or mRowCount = 0 Then Exit Sub
 
     term1 = Trim$(term1)
     term2 = Trim$(term2)
@@ -310,20 +295,26 @@ Public Sub CollectNameHits(ByVal term1 As String, ByVal op As String, ByVal term
     End If
 
     For i = 1 To mRowCount
-        If Len(mPath(i)) = 0 Then GoTo NextRow
+        path = CStr(mData(i, 1) & "")
+        If Right$(path, 1) = "\" Then path = Left$(path, Len(path) - 1)
+        If Len(path) = 0 Then GoTo NextRow
 
         If Len(filterShare) > 0 Then
-            If StrComp(mShareRoot(i), filterShare, vbTextCompare) <> 0 Then GoTo NextRow
+            share = modPathUtil.UncShareRoot(path)
+            If StrComp(share, filterShare, vbTextCompare) <> 0 Then GoTo NextRow
         End If
 
-        If mIsFolder(i) Then
+        et = UCase$(Trim$(CStr(mData(i, 4) & "")))
+        If Len(et) = 0 Then et = "FILE"
+        isFolder = (et = "FOLDER")
+        If isFolder Then
             If Not includeFolders Then GoTo NextRow
         Else
             If Not includeFiles Then GoTo NextRow
         End If
 
         If flexible Then
-            hay = mNameFlex(i)
+            hay = modPathUtil.NormalizeForMatch(path)
             has1 = (InStr(1, hay, term1N, vbBinaryCompare) > 0)
             If hasTerm2 Then
                 has2 = (InStr(1, hay, term2N, vbBinaryCompare) > 0)
@@ -332,7 +323,7 @@ Public Sub CollectNameHits(ByVal term1 As String, ByVal op As String, ByVal term
                 matched = has1
             End If
         Else
-            hay = mName(i)
+            hay = path
             has1 = (InStr(1, hay, term1, vbTextCompare) > 0)
             If hasTerm2 Then
                 has2 = (InStr(1, hay, term2, vbTextCompare) > 0)
@@ -341,26 +332,21 @@ Public Sub CollectNameHits(ByVal term1 As String, ByVal op As String, ByVal term
                 matched = has1
             End If
         End If
-
         If Not matched Then GoTo NextRow
 
-        If mIsFolder(i) Then
-            If Not folderHits.Exists(mPath(i)) Then
-                folderHits.Add mPath(i), Array(mDate(i), mSizeMb(i))
-            End If
-        Else
-            If hasSizeFilter Then
-                If Not SizeMatchesLocal(mSizeMb(i), sizeOp, sizeMb) Then GoTo NextRow
-            End If
-            If Not hits.Exists(mPath(i)) Then
-                hits.Add mPath(i), Array(mDate(i), mSizeMb(i), False, 0&, 0&)
-            End If
+        sizeVal = modPathUtil.CoerceStoredSizeMb(mData(i, 3))
+        If hasSizeFilter Then
+            If Not SizeMatchesLocal(sizeVal, sizeOp, sizeMb) Then GoTo NextRow
+        End If
+
+        dt = mData(i, 2)
+        If Not hits.Exists(path) Then
+            hits.Add path, Array(dt, sizeVal, isFolder, 0&, 0&)
         End If
 NextRow:
     Next i
 End Sub
 
-' Map Dashboard drive dropdown label to UNC share root (empty = All).
 Public Function ResolveDriveShareFilter(ByVal label As String) As String
     Dim v As String
     v = Trim$(label)
@@ -375,12 +361,10 @@ Public Function ResolveDriveShareFilter(ByVal label As String) As String
     If mDriveByLabel.Exists(v) Then
         ResolveDriveShareFilter = CStr(mDriveByLabel(v))
     Else
-        ' Allow pasting a UNC share / path directly
         ResolveDriveShareFilter = modPathUtil.UncShareRoot(v)
     End If
 End Function
 
-' Friendly drive label for results (e.g. SHARE_Public). Uses cache built on warm load.
 Public Function FriendlyLabelForShare(ByVal shareOrPath As String) As String
     Dim share As String
     Dim label As String
@@ -410,7 +394,6 @@ Public Function FriendlyLabelForShare(ByVal shareOrPath As String) As String
     FriendlyLabelForShare = label
 End Function
 
-' Rebuild drive dropdown on Dashboard H5 from unique shares in the loaded index.
 Public Sub RefreshDashboardDriveList(Optional ByVal wb As Workbook = Nothing)
     Dim map As clsSheetMap
     Dim ws As Worksheet
@@ -423,53 +406,10 @@ Public Sub RefreshDashboardDriveList(Optional ByVal wb As Workbook = Nothing)
     Dim keep As String
     Dim formula As String
     Dim activeWas As Worksheet
-    Dim share As String
-    Dim label As String
-    Dim unique As String
-    Dim suffix As Long
 
     On Error GoTo FailQuiet
     If wb Is Nothing Then Set wb = ActiveWorkbook
-    If wb Is Nothing Then
-        Debug.Print "INDEX CACHE: RefreshDashboardDriveList aborted (no workbook)"
-        Exit Sub
-    End If
-
-    ' Recover drive map if somehow empty while index rows exist
-    If mLoaded And mRowCount > 0 Then
-        If mDriveByLabel Is Nothing Then
-            Set mDriveByLabel = CreateObject("Scripting.Dictionary")
-            mDriveByLabel.CompareMode = 1
-        End If
-        If mLabelByShare Is Nothing Then
-            Set mLabelByShare = CreateObject("Scripting.Dictionary")
-            mLabelByShare.CompareMode = 1
-        End If
-        If mDriveByLabel.Count = 0 Then
-            If ShareRootArrayReady() Then
-                On Error Resume Next
-                For i = 1 To mRowCount
-                    share = mShareRoot(i)
-                    If Len(share) > 0 Then
-                        If Not mLabelByShare.Exists(share) Then
-                            label = modPathUtil.FriendlyDriveLabel(share)
-                            If Len(label) = 0 Then label = share
-                            unique = label
-                            suffix = 2
-                            Do While mDriveByLabel.Exists(unique)
-                                unique = label & " (" & CStr(suffix) & ")"
-                                suffix = suffix + 1
-                            Loop
-                            mDriveByLabel.Add unique, share
-                            mLabelByShare.Add share, unique
-                        End If
-                    End If
-                Next i
-                On Error GoTo FailQuiet
-                Debug.Print "INDEX CACHE: rebuilt drive map count=" & CStr(mDriveByLabel.Count)
-            End If
-        End If
-    End If
+    If wb Is Nothing Then Exit Sub
 
     Set map = New clsSheetMap
     map.Init wb
@@ -506,19 +446,15 @@ Public Sub RefreshDashboardDriveList(Optional ByVal wb As Workbook = Nothing)
     Err.Clear
     cell.Validation.Add Type:=xlValidateList, AlertStyle:=xlValidAlertStop, Operator:=xlBetween, _
                         Formula1:=formula
-    If Err.Number <> 0 Then
-        Debug.Print "INDEX CACHE: drive Validation.Add failed Err=" & CStr(Err.Number) & _
-                    " " & Err.Description & " formula=" & Left$(formula, 120)
-        On Error GoTo FailQuiet
-        Err.Raise Err.Number, , Err.Description
-    End If
     On Error GoTo FailQuiet
 
     With cell.Validation
         .IgnoreBlank = True
         .InCellDropdown = True
         .ShowInput = False
-        .ShowError = False
+        .ShowError = True
+        .ErrorTitle = "Drive"
+        .ErrorMessage = "Pick a drive from the list (or All)."
     End With
 
     keep = "All"
@@ -531,23 +467,149 @@ Public Sub RefreshDashboardDriveList(Optional ByVal wb As Workbook = Nothing)
 
     If Not activeWas Is Nothing Then
         On Error Resume Next
-        activeWas.Activate
+        If StrComp(activeWas.Name, ws.Name, vbTextCompare) = 0 Or activeWas.Visible <> xlSheetVisible Then
+            ws.Activate
+        Else
+            activeWas.Activate
+        End If
         On Error GoTo FailQuiet
     End If
 
-    Debug.Print "INDEX CACHE: drive dropdown @H5 items=" & CStr(n + 1) & _
-                " formula=" & formula
+    Debug.Print "INDEX: drive dropdown items=" & CStr(n + 1) & " backend=" & mBackend
     Exit Sub
 FailQuiet:
-    Debug.Print "INDEX CACHE: RefreshDashboardDriveList skipped Err=" & CStr(Err.Number) & _
-                " " & Err.Description
+    Debug.Print "INDEX: RefreshDashboardDriveList skipped Err=" & CStr(Err.Number) & " " & Err.Description
 End Sub
 
-Private Function ShareRootArrayReady() As Boolean
+' --- Private helpers ---
+
+Private Sub LoadSheetSlim(ByVal wb As Workbook)
+    Dim ws As Worksheet
+    Dim tbl As ListObject
+    Dim data As Variant
+    Dim n As Long
+    Dim cols As Long
+    Dim r As Long
+    Dim normalized() As Variant
+
+    mSheetLoaded = False
+    mData = Empty
+    mRowCount = 0
+
     On Error Resume Next
-    ShareRootArrayReady = (UBound(mShareRoot) >= 1)
+    Set ws = wb.Worksheets(SHEET_DATABASE)
+    Set tbl = ws.ListObjects(TABLE_FILES)
     On Error GoTo 0
+    If tbl Is Nothing Then Exit Sub
+    If tbl.DataBodyRange Is Nothing Then Exit Sub
+    If tbl.ListRows.Count = 0 Then Exit Sub
+
+    data = tbl.DataBodyRange.Value
+    If Not IsArray(data) Then Exit Sub
+
+    n = UBound(data, 1)
+    cols = UBound(data, 2)
+    ReDim normalized(1 To n, 1 To 4)
+    For r = 1 To n
+        normalized(r, 1) = data(r, 1)
+        If cols >= 2 Then normalized(r, 2) = data(r, 2) Else normalized(r, 2) = Empty
+        If cols >= 3 Then normalized(r, 3) = data(r, 3) Else normalized(r, 3) = 0.01
+        If cols >= 4 And Len(Trim$(CStr(data(r, 4) & ""))) > 0 Then
+            normalized(r, 4) = UCase$(Trim$(CStr(data(r, 4))))
+        Else
+            normalized(r, 4) = "FILE"
+        End If
+    Next r
+
+    mData = normalized
+    mRowCount = n
+    mSheetLoaded = True
+End Sub
+
+Private Function AccdbRowCount(ByVal wb As Workbook) As Long
+    Dim cn As Object
+    Dim rs As Object
+    AccdbRowCount = 0
+    On Error GoTo Fail
+    Set cn = OpenIndexConnection(wb)
+    Set rs = CreateObject("ADODB.Recordset")
+    rs.Open "SELECT COUNT(*) AS Cnt FROM tblFiles", cn
+    If Not rs.EOF Then AccdbRowCount = CLng(rs.Fields(0).Value & 0)
+    rs.Close
+    cn.Close
+    Exit Function
+Fail:
+    AccdbRowCount = 0
 End Function
+
+Private Sub BuildDriveMapsFromSheet()
+    Dim i As Long
+    Dim path As String
+    InitDriveMaps
+    If Not mSheetLoaded Or mRowCount = 0 Then Exit Sub
+    For i = 1 To mRowCount
+        path = CStr(mData(i, 1) & "")
+        AddShareFromPath path
+    Next i
+End Sub
+
+Private Sub BuildDriveMapsFromAccdb(ByVal wb As Workbook)
+    Dim cn As Object
+    Dim rs As Object
+    Dim share As String
+    Dim sql As String
+
+    InitDriveMaps
+    On Error GoTo Fail
+    Set cn = OpenIndexConnection(wb)
+    Set rs = CreateObject("ADODB.Recordset")
+    ' Distinct \\server\share from UNC FilePath (3rd backslash ends the share)
+    sql = "SELECT DISTINCT Left([FilePath], InStr(InStr(3,[FilePath],'\')+1,[FilePath],'\')-1) AS ShareRoot " & _
+          "FROM tblFiles WHERE Left([FilePath],2)='\\' AND InStr(3,[FilePath],'\')>0 " & _
+          "AND InStr(InStr(3,[FilePath],'\')+1,[FilePath],'\')>0"
+    rs.Open sql, cn
+    Do While Not rs.EOF
+        share = Trim$(CStr(rs.Fields(0).Value & ""))
+        If Len(share) > 0 Then AddShareFromPath share & "\"
+        rs.MoveNext
+    Loop
+    rs.Close
+    cn.Close
+    Exit Sub
+Fail:
+    Debug.Print "INDEX: BuildDriveMapsFromAccdb failed " & Err.Description
+End Sub
+
+Private Sub InitDriveMaps()
+    Set mDriveByLabel = CreateObject("Scripting.Dictionary")
+    mDriveByLabel.CompareMode = 1
+    Set mLabelByShare = CreateObject("Scripting.Dictionary")
+    mLabelByShare.CompareMode = 1
+End Sub
+
+Private Sub AddShareFromPath(ByVal path As String)
+    Dim share As String
+    Dim label As String
+    Dim unique As String
+    Dim suffix As Long
+
+    path = Trim$(path)
+    If Len(path) = 0 Then Exit Sub
+    share = modPathUtil.UncShareRoot(path)
+    If Len(share) = 0 Then Exit Sub
+    If mLabelByShare.Exists(share) Then Exit Sub
+
+    label = modPathUtil.FriendlyDriveLabel(share)
+    If Len(label) = 0 Then label = share
+    unique = label
+    suffix = 2
+    Do While mDriveByLabel.Exists(unique)
+        unique = label & " (" & CStr(suffix) & ")"
+        suffix = suffix + 1
+    Loop
+    mDriveByLabel.Add unique, share
+    mLabelByShare.Add share, unique
+End Sub
 
 Private Sub SortStringsAz(ByRef values() As String, ByVal lo As Long, ByVal hi As Long)
     Dim i As Long
@@ -576,206 +638,6 @@ Private Sub SortStringsAz(ByRef values() As String, ByVal lo As Long, ByVal hi A
     If i < hi Then SortStringsAz values, i, hi
 End Sub
 
-' O(folderHits) using counts precomputed in BuildSearchExtras.
-Public Sub CommitFolderHitsFast(ByVal hits As Object, ByVal folderHits As Object, _
-                                ByVal hasSizeFilter As Boolean, ByVal sizeOp As String, ByVal sizeMb As Double)
-    Dim key As Variant
-    Dim folderUnc As String
-    Dim meta As Variant
-    Dim folderDate As Variant
-    Dim storedMb As Double
-    Dim displayMb As Double
-    Dim rowIdx As Long
-    Dim fc As Long
-    Dim dc As Long
-    Dim lo As Long
-    Dim hi As Long
-
-    If folderHits Is Nothing Then Exit Sub
-    If folderHits.Count = 0 Then Exit Sub
-    If Not mLoaded Or mRowCount = 0 Then Exit Sub
-    If Not mExtrasReady Then BuildSearchExtras
-
-    For Each key In folderHits.Keys
-        folderUnc = CStr(key)
-        If hits.Exists(folderUnc) Then GoTo NextFolder
-
-        meta = folderHits(key)
-        folderDate = Empty
-        storedMb = 0.01
-        If IsArray(meta) Then
-            lo = LBound(meta)
-            hi = UBound(meta)
-            If hi >= lo Then
-                If Not IsEmpty(meta(lo)) Then folderDate = meta(lo)
-            End If
-            If hi >= lo + 1 Then
-                storedMb = modPathUtil.CoerceStoredSizeMb(meta(lo + 1))
-            End If
-        End If
-
-        rowIdx = 0
-        If Not mFolderRowByPath Is Nothing Then
-            If mFolderRowByPath.Exists(folderUnc) Then rowIdx = CLng(mFolderRowByPath(folderUnc))
-        End If
-        If rowIdx < 1 Or rowIdx > mRowCount Then rowIdx = 0
-
-        If storedMb > 0.01 Then
-            displayMb = storedMb
-        ElseIf rowIdx > 0 Then
-            If mDescIndexedSize(rowIdx) > 0.01 Then
-                displayMb = Round(mDescIndexedSize(rowIdx), 2)
-            Else
-                displayMb = 0.01
-            End If
-        Else
-            displayMb = 0.01
-        End If
-
-        If hasSizeFilter Then
-            If Not SizeMatchesLocal(displayMb, sizeOp, sizeMb) Then GoTo NextFolder
-        End If
-
-        If rowIdx > 0 Then
-            fc = mDescFileCount(rowIdx)
-            dc = mDescFolderCount(rowIdx)
-        Else
-            fc = 0
-            dc = 0
-        End If
-
-        hits.Add folderUnc, Array(folderDate, displayMb, True, fc, dc)
-NextFolder:
-    Next key
-End Sub
-
-Private Sub BuildSearchExtras()
-    Dim i As Long
-    Dim j As Long
-    Dim cols As Long
-    Dim t0 As Double
-    Dim tCounts As Double
-    Dim p As String
-    Dim nm As String
-    Dim parent As String
-    Dim secNames As Double
-    Dim share As String
-    Dim label As String
-    Dim unique As String
-    Dim suffix As Long
-    Dim seenShares As Object
-
-    mExtrasReady = False
-    If Not mLoaded Or mRowCount <= 0 Or Not IsArray(mData) Then Exit Sub
-
-    t0 = Timer
-    cols = UBound(mData, 2)
-    ReDim mPath(1 To mRowCount)
-    ReDim mName(1 To mRowCount)
-    ReDim mNameFlex(1 To mRowCount)
-    ReDim mIsFolder(1 To mRowCount)
-    ReDim mSizeMb(1 To mRowCount)
-    ReDim mDate(1 To mRowCount)
-    ReDim mParentIdx(1 To mRowCount)
-    ReDim mDescFileCount(1 To mRowCount)
-    ReDim mDescFolderCount(1 To mRowCount)
-    ReDim mDescIndexedSize(1 To mRowCount)
-    ReDim mShareRoot(1 To mRowCount)
-
-    Set mFolderRowByPath = CreateObject("Scripting.Dictionary")
-    mFolderRowByPath.CompareMode = 1
-    Set mDriveByLabel = CreateObject("Scripting.Dictionary")
-    mDriveByLabel.CompareMode = 1
-    Set mLabelByShare = CreateObject("Scripting.Dictionary")
-    mLabelByShare.CompareMode = 1
-    Set seenShares = CreateObject("Scripting.Dictionary")
-    seenShares.CompareMode = 1
-
-    For i = 1 To mRowCount
-        p = CStr(mData(i, 1) & "")
-        If Right$(p, 1) = "\" Then p = Left$(p, Len(p) - 1)
-        mPath(i) = p
-        nm = modPathUtil.FileNameOnly(p)
-        mName(i) = nm
-        mNameFlex(i) = modPathUtil.NormalizeForMatch(nm)
-        If cols >= 4 Then
-            mIsFolder(i) = (UCase$(Trim$(CStr(mData(i, 4) & ""))) = "FOLDER")
-        Else
-            mIsFolder(i) = False
-        End If
-        If cols >= 3 Then
-            mSizeMb(i) = modPathUtil.CoerceStoredSizeMb(mData(i, 3))
-        Else
-            mSizeMb(i) = 0.01
-        End If
-        If cols >= 2 Then
-            mDate(i) = mData(i, 2)
-        Else
-            mDate(i) = Empty
-        End If
-        mParentIdx(i) = 0
-        mDescFileCount(i) = 0
-        mDescFolderCount(i) = 0
-        mDescIndexedSize(i) = 0
-        share = modPathUtil.UncShareRoot(p)
-        mShareRoot(i) = share
-        If Len(share) > 0 Then
-            If Not seenShares.Exists(share) Then
-                seenShares.Add share, True
-                label = modPathUtil.FriendlyDriveLabel(share)
-                If Len(label) = 0 Then label = share
-                unique = label
-                suffix = 2
-                Do While mDriveByLabel.Exists(unique)
-                    unique = label & " (" & CStr(suffix) & ")"
-                    suffix = suffix + 1
-                Loop
-                mDriveByLabel.Add unique, share
-                mLabelByShare.Add share, unique
-                Debug.Print "INDEX CACHE: drive map " & unique & " <= " & share
-            End If
-        End If
-        If mIsFolder(i) And Len(p) > 0 Then
-            If Not mFolderRowByPath.Exists(p) Then mFolderRowByPath.Add p, i
-        End If
-        If i Mod 2500 = 0 Then DoEvents
-    Next i
-
-    ' Immediate parent folder row for each entry
-    For i = 1 To mRowCount
-        parent = ParentNoSlash(mPath(i))
-        If Len(parent) > 0 Then
-            If mFolderRowByPath.Exists(parent) Then mParentIdx(i) = CLng(mFolderRowByPath(parent))
-        End If
-    Next i
-
-    secNames = ElapsedSeconds(t0)
-
-    ' Bubble descendant counts / indexed size up the parent chain (once per warm load)
-    tCounts = Timer
-    For i = 1 To mRowCount
-        j = mParentIdx(i)
-        Do While j > 0
-            If mIsFolder(i) Then
-                mDescFolderCount(j) = mDescFolderCount(j) + 1
-            Else
-                mDescFileCount(j) = mDescFileCount(j) + 1
-                mDescIndexedSize(j) = mDescIndexedSize(j) + mSizeMb(i)
-            End If
-            j = mParentIdx(j)
-        Loop
-    Next i
-
-    mExtrasReady = True
-    Debug.Print "INDEX CACHE: BuildSearchExtras rows=" & CStr(mRowCount) & _
-                " drives=" & CStr(mDriveByLabel.Count) & _
-                " names=" & FormatSeconds(secNames) & _
-                " descCounts=" & FormatSeconds(ElapsedSeconds(tCounts)) & _
-                " total=" & FormatSeconds(ElapsedSeconds(t0))
-
-    RefreshDashboardDriveList ActiveWorkbook
-End Sub
-
 Private Function CombineMatch(ByVal has1 As Boolean, ByVal has2 As Boolean, ByVal op As String) As Boolean
     Select Case op
         Case "AND"
@@ -798,13 +660,6 @@ Private Function SizeMatchesLocal(ByVal fileMb As Double, ByVal sizeOp As String
         Case Else
             SizeMatchesLocal = True
     End Select
-End Function
-
-Private Function ParentNoSlash(ByVal fullPath As String) As String
-    Dim parent As String
-    parent = modPathUtil.ParentFolderPath(fullPath)
-    If Right$(parent, 1) = "\" Then parent = Left$(parent, Len(parent) - 1)
-    ParentNoSlash = parent
 End Function
 
 Private Function ElapsedSeconds(ByVal startTimer As Double) As Double

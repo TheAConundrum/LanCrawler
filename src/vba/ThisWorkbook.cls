@@ -41,3 +41,16 @@ Private Sub Workbook_SheetBeforeDoubleClick(ByVal Sh As Object, ByVal Target As 
     HandleDashboardResultDoubleClick Sh, Target, Cancel
     On Error GoTo 0
 End Sub
+
+' Snap chrome columns back if the user dragged them (Excel cannot lock widths per-column).
+Private Sub Workbook_SheetSelectionChange(ByVal Sh As Object, ByVal Target As Range)
+    Dim map As clsSheetMap
+    On Error Resume Next
+    If Sh Is Nothing Then Exit Sub
+    If StrComp(Sh.Name, "Dashboard", vbTextCompare) <> 0 Then Exit Sub
+    If Not DashboardFixedWidthsReady Then Exit Sub
+    Set map = New clsSheetMap
+    map.Init Sh.Parent
+    map.RestoreDashboardFixedColumnWidths Sh
+    On Error GoTo 0
+End Sub

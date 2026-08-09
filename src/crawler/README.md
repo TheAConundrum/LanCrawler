@@ -1,6 +1,6 @@
 # LAN Search Tool — Parallel Python Crawler
 
-Faster LAN indexing than the VBA `FileSystemObject` crawl. Walks folders with a **thread pool** + `os.scandir`, applies the same allowlist / junk / split-archive rules as `modPathUtil`, and writes `tblFiles`-compatible CSV (and optional SQLite).
+Faster LAN indexing than the VBA `FileSystemObject` crawl. Walks folders with a **thread pool** + `os.scandir`, applies the same allowlist / junk / split-archive rules as `modPathUtil`, and writes an exclusive index: onboard `Database!tblFiles` (small) or Access AccDB (large).
 
 ## Why it’s faster
 
@@ -9,18 +9,25 @@ LAN crawls are dominated by waiting on directory listings. Multiple workers over
 ## Requirements
 
 - Python 3.10+ on Windows
-- Stdlib only for crawl/CSV/SQLite
-- Optional Excel import: `pip install -r requirements-crawler.txt` (xlwings)
+- Stdlib for crawl/CSV
+- AccDB + Excel import: `pip install -r requirements-crawler.txt` (`xlwings`, `pyodbc`, `pywin32`)
+- Microsoft Access Database Engine (ACE) matching Office bitness (for AccDB create/query)
 
 ## Quick start (easiest in Cursor)
 
 **Run Task:** `Crawl LAN folder (picker)`  
-or **Run and Debug:** `Crawl LAN folder (picker)`  
 or right-click / Run: `src/crawler/run_crawl.py`
 
-A Windows folder dialog opens (check the taskbar if it’s behind Cursor). After the crawl it **auto-imports** into `Blank_LAN_Crawler Tool.xlsm` (no prompts): events/screen off → write → save → close → reopen so `Workbook_Open` warms the search cache. CSV still goes to `crawl_output\`.
+A small GUI asks for:
 
-Direct file run also works on `crawl.py` / `run_crawl.py` (same flow).
+1. Folder / drive to crawl  
+2. Target workbook (defaults to `AccDB-Blank_LAN_Crawler Tool.xlsm`)  
+3. Index target: **Auto** | **Workbook** | **AccDB**
+
+**Auto / Workbook** under **750,000** rows → import into `Database!tblFiles`.  
+**AccDB**, or any mode above **750,000** rows → write `{workbook}\DB\LAN_Search_Index.accdb`, clear onboard `tblFiles`, and inform you. CSV still goes to `crawl_output\`.
+
+Keep `Blank_LAN_Crawler Tool.xlsm` as the stable non-AccDB template; AccDB development uses `AccDB-Blank_LAN_Crawler Tool.xlsm`.
 
 UNC also works:
 
@@ -28,26 +35,22 @@ UNC also works:
 python -m crawler "\\fileserver\share$\Some Folder" -w 24
 ```
 
-Outputs default to `crawl_output\<timestamp>_tblFiles.csv`.
-
 ### Common flags
 
 | Flag | Meaning |
 |------|---------|
 | `-w` / `--workers` | Parallel folder workers (default **16**; try 8–32) |
 | `-o path.csv` | CSV output path |
-| `--sqlite path.sqlite` | Also write SQLite `tblFiles` |
+| `--accdb path.accdb` | Write AccDB `tblFiles` |
+| `--target Auto\|Workbook\|AccDB` | Exclusive index mode with `--import-excel` |
 | `--unc-root \\server\share` | Override if mapped-drive → UNC fails |
-| `--import-excel "..\Blank_LAN_Crawler Tool.xlsm"` | Push CSV into `Database!tblFiles` after crawl |
-| `--mode ReplaceRoot` | Import mode: `ReplaceRoot` (default), `Append`, `RebuildAll` |
+| `--import-excel "..\AccDB-Blank_LAN_Crawler Tool.xlsm"` | Workbook for sheet import or AccDB relative `\DB\` path |
 
-### Crawl + import in one step
+### Crawl + AccDB / Excel
 
 ```bat
-python -m crawler "O:\Some Folder" -w 16 --import-excel "..\Blank_LAN_Crawler Tool.xlsm" --mode ReplaceRoot
+python -m crawler "O:\Some Folder" -w 16 --import-excel "..\AccDB-Blank_LAN_Crawler Tool.xlsm" --target Auto
 ```
-
-Excel import always: close target if open → open with **events/screen off** → write `tblFiles` + Ingestion summary → **enforce UI lock** (keywords+MB only; Database very hidden) → save → close → **reopen with events on** (cache warm). Excel stays open at the end. Does **not** touch the VBA project password (set that once in the VBE as admin).
 
 ## Output columns (same as VBA `tblFiles`)
 
@@ -58,7 +61,7 @@ Excel import always: close target if open → open with **events/screen off** �
 | SizeMB | 2 decimals; min 0.01 |
 | EntryType | `FILE` or `FOLDER` |
 
-**FOLDER SizeMB** = recursive disk total of **all** files under that folder (including non-indexed extensions), matching the VBA crawler.
+**FOLDER SizeMB** = recursive disk total of **all** files under that folder (including non-indexed extensions).
 
 ## Filters (parity with VBA)
 
@@ -70,16 +73,18 @@ Excel import always: close target if open → open with **events/screen off** �
 
 ```text
 src/crawler/
-  __main__.py      CLI
-  crawl.py         Thread-pool crawler
-  filters.py       Allowlist / junk / split volumes
-  paths.py         UNC resolve, size helpers
-  import_to_excel.py
+  __main__.py         CLI
+  crawl.py            Thread-pool crawler + write_accdb
+  crawl_gui.py        Small target GUI
+  filters.py          Allowlist / junk / split volumes
+  paths.py            UNC resolve, size helpers
+  import_to_excel.py  Sheet import + clear_onboard_tblfiles
+  run_crawl.py        Launcher
 ```
 
 ## Tips
 
 1. Prefer **UNC** paths when possible (one less mapping hop).
 2. If the server feels saturated, **lower** `--workers` (e.g. 8). If it feels idle, try **24–32**.
-3. After import, wait ~2s for the deferred index cache warm (Immediate Window shows `INDEX CACHE` lines).
-4. Large ReplaceRoot imports still rewrite the Excel table once at the end — the slow part is the crawl, which is now parallel.
+3. After AccDB write, reopen the workbook so search resolves the AccDB backend (sheet is cleared).
+4. ACE must be installed on machines that crawl to AccDB **and** on machines that search AccDB from Excel.

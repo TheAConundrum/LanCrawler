@@ -8,6 +8,31 @@ Option Explicit
 '
 ' Helpers: modPathUtil, modIndexCache (Option Private Module).
 
+' Dashboard columns that stay fixed width while AllowFormattingColumns is on:
+' A:F, H:J, L:N (session snapshot; G/K/O+ remain user-resizable).
+Private mDashFixedW(1 To 14) As Double
+Private mDashFixedWReady As Boolean
+
+Public Property Get DashboardFixedWidthsReady() As Boolean
+    DashboardFixedWidthsReady = mDashFixedWReady
+End Property
+
+Public Property Let DashboardFixedWidthsReady(ByVal ready As Boolean)
+    mDashFixedWReady = ready
+End Property
+
+Public Sub SetDashboardFixedWidth(ByVal col As Long, ByVal width As Double)
+    If col >= 1 And col <= 14 Then mDashFixedW(col) = width
+End Sub
+
+Public Function GetDashboardFixedWidth(ByVal col As Long) As Double
+    If col >= 1 And col <= 14 Then
+        GetDashboardFixedWidth = mDashFixedW(col)
+    Else
+        GetDashboardFixedWidth = 0#
+    End If
+End Function
+
 Public Sub RunIndexFromIngestion()
     Dim map As clsSheetMap
     Dim appState As clsExcelAppState

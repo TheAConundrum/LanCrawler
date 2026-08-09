@@ -9,10 +9,9 @@ Attribute VB_PredeclaredId = False
 Attribute VB_Exposed = False
 Option Explicit
 
-' Searches Database!tblFiles in memory:
-' - File hits: match against file name only
-' - Folder hits (optional, default on): match folder names, one collapsed row
-'   with recursive file/folder counts (not every file under that folder)
+' Searches the exclusive session backend (Sheet or AccDB):
+' - Sheet: slim FilePath scan via modIndexCache.CollectPathHits
+' - AccDB: late-bound ADODB SQL with FilePath LIKE / size / EntryType filters
 
 Private mMap As clsSheetMap
 Private mApp As clsExcelAppState
@@ -37,6 +36,7 @@ Public Sub RunFromDashboard()
     Dim secScan As Double
     Dim secWrite As Double
     Dim cacheHit As Boolean
+    Dim backend As String
 
     tAll = Timer
     calcPrev = Application.Calculation
@@ -48,7 +48,8 @@ Public Sub RunFromDashboard()
     hits.CompareMode = 1 ' TextCompare
 
     Debug.Print "========== SEARCH TIMING START =========="
-    Debug.Print "SEARCH: cache already loaded before get? " & CStr(modIndexCache.IsIndexLoaded) & _
+    Debug.Print "SEARCH: resolved before get? " & CStr(modIndexCache.IsIndexLoaded) & _
+                " backend=" & modIndexCache.CurrentBackend & _
                 " rows=" & CStr(modIndexCache.IndexRowCount)
 
     tPhase = Timer
@@ -56,24 +57,24 @@ Public Sub RunFromDashboard()
     secGet = ElapsedSeconds(tPhase)
     cacheHit = modIndexCache.LastGetWasCacheHit
     rowCount = modIndexCache.IndexRowCount
+    backend = modIndexCache.CurrentBackend
 
-    If cacheHit Then
-        Debug.Print "SEARCH: EnsureLoaded HIT rows=" & CStr(rowCount) & _
-                    " elapsed=" & FormatSeconds(secGet)
-    Else
-        Debug.Print "SEARCH: EnsureLoaded MISS rows=" & CStr(rowCount) & _
-                    " elapsed=" & FormatSeconds(secGet) & _
-                    " load=" & FormatSeconds(modIndexCache.LastLoadSeconds)
-    End If
+    Debug.Print "SEARCH: EnsureLoaded backend=" & backend & " rows=" & CStr(rowCount) & _
+                " hit=" & CStr(cacheHit) & " elapsed=" & FormatSeconds(secGet)
 
-    If rowCount = 0 Then
+    If rowCount = 0 Or backend = modIndexCache.BACKEND_EMPTY Then
         ClearResults
         WriteSearchStats 0, 0, 0#
         mMap.ProtectDashboardResults
         Application.Calculation = calcPrev
         mApp.Restore
-        Debug.Print "SEARCH: aborted empty database total=" & FormatSeconds(ElapsedSeconds(tAll))
-        MsgBox "Database is empty. Ingest a folder first.", vbExclamation, "LAN Search - Dashboard"
+        mMap.FocusDashboardResultsHome
+        Debug.Print "SEARCH: aborted empty index total=" & FormatSeconds(ElapsedSeconds(tAll))
+        MsgBox "No index available." & vbCrLf & vbCrLf & _
+               "Onboard Database!tblFiles is empty and no AccDB was found at:" & vbCrLf & _
+               modIndexCache.AccdbPath(ActiveWorkbook) & vbCrLf & vbCrLf & _
+               "Crawl into the workbook (small) or AccDB (large), then reopen.", _
+               vbExclamation, "LAN Search - Dashboard"
         Exit Sub
     End If
 
@@ -89,6 +90,7 @@ Public Sub RunFromDashboard()
         mMap.ProtectDashboardResults
         Application.Calculation = calcPrev
         mApp.Restore
+        mMap.FocusDashboardResultsHome
         Debug.Print "SEARCH: aborted no criteria total=" & FormatSeconds(ElapsedSeconds(tAll))
         MsgBox "Enter at least one Key Word in the criteria table.", vbExclamation, "LAN Search - Dashboard"
         Exit Sub
@@ -101,12 +103,13 @@ Public Sub RunFromDashboard()
 
     Application.Calculation = calcPrev
     mApp.Restore
+    mMap.FocusDashboardResultsHome
 
     Debug.Print "SEARCH SUMMARY: get=" & FormatSeconds(secGet) & _
                 " scan=" & FormatSeconds(secScan) & _
                 " write=" & FormatSeconds(secWrite) & _
                 " TOTAL=" & FormatSeconds(ElapsedSeconds(tAll)) & _
-                " cacheHit=" & CStr(cacheHit) & " rows=" & CStr(rowCount) & " hits=" & CStr(hits.Count)
+                " backend=" & backend & " rows=" & CStr(rowCount) & " hits=" & CStr(hits.Count)
     Debug.Print "========== SEARCH TIMING END =========="
 
     If mLastDisplayedCount > 0 And mLastDisplayedCount < mLastHitCount Then
@@ -120,6 +123,7 @@ Public Sub RunFromDashboard()
                "Double-click a File name to open its folder.", _
                vbInformation, "LAN Search - Dashboard"
     End If
+    mMap.FocusDashboardResultsHome
     Exit Sub
 
 Fail:
@@ -128,12 +132,12 @@ Fail:
     On Error Resume Next
     Application.Calculation = calcPrev
     mApp.Restore
+    mMap.FocusDashboardResultsHome
     Debug.Print "SEARCH FAILED: " & errDesc & " after " & FormatSeconds(ElapsedSeconds(tAll))
     On Error GoTo 0
     MsgBox "Search failed: " & errDesc, vbCritical, "LAN Search - Dashboard"
 End Sub
 
-' Uses modIndexCache parallel arrays — no per-search Variant copy / re-normalize.
 Private Sub SearchIndex(ByVal hits As Object, ByRef anyCriteria As Boolean)
     Dim row As Long
     Dim term1 As String
@@ -146,25 +150,26 @@ Private Sub SearchIndex(ByVal hits As Object, ByRef anyCriteria As Boolean)
     Dim foldersMode As String
     Dim includeFiles As Boolean
     Dim includeFolders As Boolean
-    Dim folderHits As Object
-    Dim tScan As Double
-    Dim tCommit As Double
-    Dim fileHitsBefore As Long
     Dim shareFilter As String
+    Dim backend As String
+    Dim cn As Object
+    Dim tScan As Double
+    Dim fileHitsBefore As Long
 
     flexible = mMap.FlexibleMatch
     foldersMode = mMap.SearchFoldersMode
     includeFiles = (foldersMode <> "Only")
     includeFolders = (foldersMode = "Yes" Or foldersMode = "Only")
     shareFilter = modIndexCache.ResolveDriveShareFilter(mMap.DriveFilterLabel)
+    backend = modIndexCache.CurrentBackend
 
-    Debug.Print "SEARCH: foldersMode=" & foldersMode & _
-                " includeFiles=" & CStr(includeFiles) & _
-                " includeFolders=" & CStr(includeFolders) & _
-                " flexible=" & CStr(flexible) & _
-                " drive=" & mMap.DriveFilterLabel & _
-                " shareFilter=" & shareFilter & _
-                " n=" & CStr(modIndexCache.IndexRowCount)
+    Debug.Print "SEARCH: backend=" & backend & " foldersMode=" & foldersMode & _
+                " flexible=" & CStr(flexible) & " drive=" & mMap.DriveFilterLabel & _
+                " shareFilter=" & shareFilter & " n=" & CStr(modIndexCache.IndexRowCount)
+
+    If backend = modIndexCache.BACKEND_ACCDB Then
+        Set cn = modIndexCache.OpenIndexConnection(ActiveWorkbook)
+    End If
 
     For row = mMap.CriteriaFirstRow To mMap.CriteriaLastRow
         term1 = Trim$(CStr(mMap.Dashboard.Cells(row, mMap.CriteriaColTerm1).Value & ""))
@@ -186,27 +191,177 @@ Private Sub SearchIndex(ByVal hits As Object, ByRef anyCriteria As Boolean)
             Err.Raise vbObjectError + 2, , "Size filter incomplete (row " & CStr(row) & ")."
         End If
 
-        Set folderHits = CreateObject("Scripting.Dictionary")
-        folderHits.CompareMode = 1
         fileHitsBefore = hits.Count
-
         tScan = Timer
-        modIndexCache.CollectNameHits term1, op, term2, flexible, _
-            includeFiles, includeFolders, hasSizeFilter, sizeOp, sizeMb, _
-            hits, folderHits, shareFilter
-        Debug.Print "SEARCH: criteria row " & CStr(row) & " scan=" & FormatSeconds(ElapsedSeconds(tScan)) & _
-                    " term1=" & term1 & " fileHits+" & CStr(hits.Count - fileHitsBefore) & _
-                    " folderNameHits=" & CStr(folderHits.Count)
 
-        If includeFolders Then
-            tCommit = Timer
-            modIndexCache.CommitFolderHitsFast hits, folderHits, hasSizeFilter, sizeOp, sizeMb
-            Debug.Print "SEARCH: criteria row " & CStr(row) & " CommitFolderHits=" & _
-                        FormatSeconds(ElapsedSeconds(tCommit)) & _
-                        " folderHits=" & CStr(folderHits.Count) & " (precomputed counts)"
+        If backend = modIndexCache.BACKEND_ACCDB Then
+            SearchAccdbCriteria cn, hits, term1, op, term2, flexible, _
+                includeFiles, includeFolders, hasSizeFilter, sizeOp, sizeMb, shareFilter
+        Else
+            modIndexCache.CollectPathHits term1, op, term2, flexible, _
+                includeFiles, includeFolders, hasSizeFilter, sizeOp, sizeMb, _
+                hits, shareFilter
         End If
+
+        Debug.Print "SEARCH: criteria row " & CStr(row) & " scan=" & FormatSeconds(ElapsedSeconds(tScan)) & _
+                    " term1=" & term1 & " hits+" & CStr(hits.Count - fileHitsBefore)
     Next row
+
+    If Not cn Is Nothing Then
+        On Error Resume Next
+        cn.Close
+        On Error GoTo 0
+    End If
 End Sub
+
+Private Sub SearchAccdbCriteria(ByVal cn As Object, ByVal hits As Object, _
+                                ByVal term1 As String, ByVal op As String, ByVal term2 As String, _
+                                ByVal flexible As Boolean, _
+                                ByVal includeFiles As Boolean, ByVal includeFolders As Boolean, _
+                                ByVal hasSizeFilter As Boolean, ByVal sizeOp As String, ByVal sizeMb As Double, _
+                                ByVal shareFilter As String)
+    Dim rs As Object
+    Dim sql As String
+    Dim whereSql As String
+    Dim path As String
+    Dim et As String
+    Dim isFolder As Boolean
+    Dim sizeVal As Double
+    Dim dt As Variant
+    Dim t1 As String
+    Dim t2 As String
+
+    t1 = term1
+    t2 = term2
+    If flexible Then
+        t1 = modPathUtil.NormalizeForMatch(term1)
+        If Len(Trim$(term2)) > 0 Then t2 = modPathUtil.NormalizeForMatch(term2)
+        If Len(t1) = 0 Then Exit Sub
+    End If
+
+    whereSql = BuildAccdbWhere(t1, op, t2, includeFiles, includeFolders, _
+                               hasSizeFilter, sizeOp, sizeMb, shareFilter)
+    sql = "SELECT FilePath, FileDate, SizeMB, EntryType FROM tblFiles WHERE " & whereSql
+
+    Set rs = CreateObject("ADODB.Recordset")
+    rs.CursorLocation = 3 ' adUseClient
+    rs.Open sql, cn
+
+    Do While Not rs.EOF
+        path = Trim$(CStr(rs.Fields("FilePath").Value & ""))
+        If Right$(path, 1) = "\" Then path = Left$(path, Len(path) - 1)
+        If Len(path) > 0 Then
+            If flexible Then
+                ' SQL matched raw FilePath; re-check normalized path for flexible mode
+                If Not FlexiblePathMatches(path, t1, op, t2) Then GoTo NextRec
+            End If
+            et = UCase$(Trim$(CStr(rs.Fields("EntryType").Value & "")))
+            If Len(et) = 0 Then et = "FILE"
+            isFolder = (et = "FOLDER")
+            sizeVal = modPathUtil.CoerceStoredSizeMb(rs.Fields("SizeMB").Value)
+            dt = rs.Fields("FileDate").Value
+            If Not hits.Exists(path) Then
+                hits.Add path, Array(dt, sizeVal, isFolder, 0&, 0&)
+            End If
+        End If
+NextRec:
+        rs.MoveNext
+    Loop
+    rs.Close
+End Sub
+
+Private Function FlexiblePathMatches(ByVal path As String, ByVal term1N As String, _
+                                     ByVal op As String, ByVal term2N As String) As Boolean
+    Dim hay As String
+    Dim has1 As Boolean
+    Dim has2 As Boolean
+    Dim hasTerm2 As Boolean
+
+    hay = modPathUtil.NormalizeForMatch(path)
+    has1 = (InStr(1, hay, term1N, vbBinaryCompare) > 0)
+    hasTerm2 = (Len(term2N) > 0 And Len(op) > 0)
+    If hasTerm2 Then
+        has2 = (InStr(1, hay, term2N, vbBinaryCompare) > 0)
+        Select Case UCase$(op)
+            Case "AND": FlexiblePathMatches = has1 And has2
+            Case "OR": FlexiblePathMatches = has1 Or has2
+            Case "NOT": FlexiblePathMatches = has1 And (Not has2)
+            Case Else: FlexiblePathMatches = has1
+        End Select
+    Else
+        FlexiblePathMatches = has1
+    End If
+End Function
+
+Private Function BuildAccdbWhere(ByVal term1 As String, ByVal op As String, ByVal term2 As String, _
+                                 ByVal includeFiles As Boolean, ByVal includeFolders As Boolean, _
+                                 ByVal hasSizeFilter As Boolean, ByVal sizeOp As String, ByVal sizeMb As Double, _
+                                 ByVal shareFilter As String) As String
+    Dim parts As String
+    Dim kw As String
+    Dim et As String
+
+    kw = KeywordClause(term1, op, term2)
+    parts = "(" & kw & ")"
+
+    If includeFiles And Not includeFolders Then
+        et = "(EntryType='FILE' OR EntryType IS NULL OR EntryType='')"
+        parts = parts & " AND " & et
+    ElseIf includeFolders And Not includeFiles Then
+        parts = parts & " AND EntryType='FOLDER'"
+    End If
+
+    If hasSizeFilter Then
+        If sizeOp = ">" Then
+            parts = parts & " AND SizeMB>" & Replace(CStr(sizeMb), ",", ".")
+        ElseIf sizeOp = "<" Then
+            parts = parts & " AND SizeMB<" & Replace(CStr(sizeMb), ",", ".")
+        End If
+    End If
+
+    If Len(Trim$(shareFilter)) > 0 Then
+        parts = parts & " AND FilePath LIKE '" & EscapeAccessLike(shareFilter & "\") & "%'"
+    End If
+
+    BuildAccdbWhere = parts
+End Function
+
+Private Function KeywordClause(ByVal term1 As String, ByVal op As String, ByVal term2 As String) As String
+    Dim c1 As String
+    Dim c2 As String
+    Dim hasTerm2 As Boolean
+
+    ' ACE OLEDB LIKE uses ANSI wildcards % and _
+    c1 = "FilePath LIKE '%" & EscapeAccessLike(term1) & "%'"
+    hasTerm2 = (Len(Trim$(term2)) > 0 And Len(Trim$(op)) > 0)
+    If Not hasTerm2 Then
+        KeywordClause = c1
+        Exit Function
+    End If
+    c2 = "FilePath LIKE '%" & EscapeAccessLike(term2) & "%'"
+    Select Case UCase$(Trim$(op))
+        Case "AND"
+            KeywordClause = "(" & c1 & " AND " & c2 & ")"
+        Case "OR"
+            KeywordClause = "(" & c1 & " OR " & c2 & ")"
+        Case "NOT"
+            KeywordClause = "(" & c1 & " AND NOT " & c2 & ")"
+        Case Else
+            KeywordClause = c1
+    End Select
+End Function
+
+Private Function EscapeAccessLike(ByVal text As String) As String
+    Dim s As String
+    s = Replace(text, "'", "''")
+    s = Replace(s, "[", "[[]")
+    s = Replace(s, "%", "[%]")
+    s = Replace(s, "_", "[_]")
+    s = Replace(s, "*", "[*]")
+    s = Replace(s, "?", "[?]")
+    s = Replace(s, "#", "[#]")
+    EscapeAccessLike = s
+End Function
 
 Private Function ParseSizeFilter(ByRef sizeOp As String, ByVal sizeValue As Variant, ByRef sizeMb As Double) As Boolean
     Dim opNorm As String
@@ -389,9 +544,17 @@ Private Sub WriteResults(ByVal hits As Object)
         If isFolderHit Then
             folderCount = folderCount + 1
             groupFolderUnc = uncPath
-            displayName = modPathUtil.FileNameOnly(uncPath) & " (" & _
-                          Format$(CLng(meta(3)), "#,##0") & " files, " & _
-                          Format$(CLng(meta(4)), "#,##0") & " folders)"
+            If IsArray(meta) And UBound(meta) >= 4 Then
+                If CLng(meta(3) & 0) > 0 Or CLng(meta(4) & 0) > 0 Then
+                    displayName = modPathUtil.FileNameOnly(uncPath) & " (" & _
+                                  Format$(CLng(meta(3)), "#,##0") & " files, " & _
+                                  Format$(CLng(meta(4)), "#,##0") & " folders)"
+                Else
+                    displayName = modPathUtil.FileNameOnly(uncPath)
+                End If
+            Else
+                displayName = modPathUtil.FileNameOnly(uncPath)
+            End If
             If i <= writeN Then
                 outFile(i, 1) = displayName
                 outLink(i, 1) = uncPath ' double-click opens this folder
@@ -471,6 +634,11 @@ Private Sub WriteResults(ByVal hits As Object)
     With fileRng.Font
         .Color = RGB(5, 99, 193)
         .Underline = xlUnderlineStyleSingle
+    End With
+    ' Folder Path / Drive Address: plain text only (blank repeats are intentional grouping)
+    With ws.Range(ws.Cells(firstDataRow, driveCol), ws.Cells(firstDataRow + writeN - 1, folderCol))
+        .Font.ColorIndex = xlColorIndexAutomatic
+        .Font.Underline = xlUnderlineStyleNone
     End With
     Debug.Print "SEARCH: sheet dump+formats=" & FormatSeconds(ElapsedSeconds(tPhase)) & _
                 " sizeSample=" & CStr(outSize(1, 1)) & " (no hyperlink COM)"
