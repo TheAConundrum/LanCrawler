@@ -67,6 +67,7 @@ class IndexRow:
     file_date: str  # yyyy-mm-dd or ""
     size_mb: float
     entry_type: str
+    size_unknown: bool = False  # True only when the crawl stat failed
 
 
 @dataclass
@@ -153,9 +154,11 @@ def scan_folder(
         try:
             st = entry.stat(follow_symlinks=False)
             size = int(st.st_size)
+            size_unknown = False
         except OSError:
             size = 0
             st = None
+            size_unknown = True
 
         if size > 0:
             result.local_bytes += size
@@ -176,6 +179,7 @@ def scan_folder(
                 file_date=created,
                 size_mb=bytes_to_size_mb(size),
                 entry_type=ENTRY_FILE,
+                size_unknown=size_unknown,
             )
         )
 
@@ -310,13 +314,16 @@ def _retry_missing_file_sizes(
     delay_sec: float = 0.15,
 ) -> int:
     """
-    Re-stat FILE rows that landed on the 0.01 MB floor (failed/zero size at crawl).
-    Network shares sometimes need a second look for large files.
+    Re-stat FILE rows whose first scandir.stat failed.
+
+    Do not retry files that already have a known size. bytes_to_size_mb floors
+    anything under ~10 KB to 0.01 MB, so treating that floor as "missing" would
+    re-hit thousands of tiny files and never update them.
     """
     need_idx = [
         i
         for i, r in enumerate(rows)
-        if r.entry_type == ENTRY_FILE and float(r.size_mb) <= MIN_SIZE_MB
+        if r.entry_type == ENTRY_FILE and r.size_unknown
     ]
     if not need_idx:
         return 0
@@ -325,7 +332,7 @@ def _retry_missing_file_sizes(
         if on_progress:
             on_progress(msg)
 
-    emit(f"size retry: re-statting {len(need_idx):,} file(s) with missing size...")
+    emit(f"size retry: re-statting {len(need_idx):,} file(s) whose first stat failed...")
     updated = 0
     for n, i in enumerate(need_idx, start=1):
         path = rows[i].path
@@ -333,22 +340,20 @@ def _retry_missing_file_sizes(
         for attempt in range(max(1, attempts)):
             try:
                 size_bytes = int(os.stat(path, follow_symlinks=False).st_size)
-                if size_bytes > 0:
-                    break
+                break
             except OSError:
                 size_bytes = 0
             if attempt + 1 < attempts:
                 time.sleep(delay_sec)
+        rows[i] = IndexRow(
+            path=rows[i].path,
+            file_date=rows[i].file_date,
+            size_mb=bytes_to_size_mb(size_bytes),
+            entry_type=rows[i].entry_type,
+            size_unknown=False,
+        )
         if size_bytes > 0:
-            new_mb = bytes_to_size_mb(size_bytes)
-            if new_mb > MIN_SIZE_MB:
-                rows[i] = IndexRow(
-                    path=rows[i].path,
-                    file_date=rows[i].file_date,
-                    size_mb=new_mb,
-                    entry_type=rows[i].entry_type,
-                )
-                updated += 1
+            updated += 1
         if n % 100 == 0:
             emit(f"size retry: {n:,}/{len(need_idx):,} checked, updated={updated:,}")
     return updated

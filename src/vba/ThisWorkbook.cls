@@ -54,3 +54,10 @@ Private Sub Workbook_SheetSelectionChange(ByVal Sh As Object, ByVal Target As Ra
     map.RestoreDashboardFixedColumnWidths Sh
     On Error GoTo 0
 End Sub
+
+' Unlocked results are selectable/copyable; revert typed/pasted edits.
+Private Sub Workbook_SheetChange(ByVal Sh As Object, ByVal Target As Range)
+    On Error Resume Next
+    RejectDashboardResultsEdit Sh, Target
+    On Error GoTo 0
+End Sub

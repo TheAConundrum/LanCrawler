@@ -297,6 +297,76 @@ Public Function FileNameOnly(ByVal fullPath As String) As String
     End If
 End Function
 
+' Keyword match against a haystack (full path for files, leaf name for folders).
+Public Function TextMatchesCriteria(ByVal text As String, ByVal term1 As String, _
+                                   ByVal op As String, ByVal term2 As String, _
+                                   ByVal flexible As Boolean, _
+                                   Optional ByVal extraAndTerm As String = "") As Boolean
+    Dim hay As String
+    Dim t1 As String
+    Dim t2 As String
+    Dim extra As String
+    Dim hasTerm2 As Boolean
+    Dim has1 As Boolean
+    Dim has2 As Boolean
+    Dim matched As Boolean
+    Dim cmp As VbCompareMethod
+
+    t1 = Trim$(term1)
+    t2 = Trim$(term2)
+    extra = Trim$(extraAndTerm)
+    op = UCase$(Trim$(op))
+    hasTerm2 = (Len(t2) > 0 And Len(op) > 0)
+
+    If Len(t1) = 0 Then
+        TextMatchesCriteria = False
+        Exit Function
+    End If
+
+    If flexible Then
+        hay = NormalizeForMatch(text)
+        t1 = NormalizeForMatch(t1)
+        If hasTerm2 Then t2 = NormalizeForMatch(t2)
+        If Len(extra) > 0 Then extra = NormalizeForMatch(extra)
+        If Len(t1) = 0 Then
+            TextMatchesCriteria = False
+            Exit Function
+        End If
+        cmp = vbBinaryCompare
+    Else
+        hay = text
+        cmp = vbTextCompare
+    End If
+
+    has1 = (InStr(1, hay, t1, cmp) > 0)
+    If hasTerm2 Then
+        has2 = (InStr(1, hay, t2, cmp) > 0)
+        Select Case op
+            Case "AND": matched = has1 And has2
+            Case "OR": matched = has1 Or has2
+            Case "NOT": matched = has1 And (Not has2)
+            Case Else: matched = has1
+        End Select
+    Else
+        matched = has1
+    End If
+
+    If matched And Len(extra) > 0 Then
+        matched = (InStr(1, hay, extra, cmp) > 0)
+    End If
+
+    TextMatchesCriteria = matched
+End Function
+
+' Folder rows match the folder's own name only — not ancestor names in the path.
+Public Function FolderLeafMatchesCriteria(ByVal folderPath As String, ByVal term1 As String, _
+                                         ByVal op As String, ByVal term2 As String, _
+                                         ByVal flexible As Boolean, _
+                                         Optional ByVal extraAndTerm As String = "") As Boolean
+    FolderLeafMatchesCriteria = TextMatchesCriteria(FileNameOnly(folderPath), term1, op, term2, _
+                                                    flexible, extraAndTerm)
+End Function
+
 ' Flexible match: lowercase and strip punctuation separators; keep \ and /.
 ' Single-pass (no per-separator Replace) for search hot path.
 Public Function NormalizeForMatch(ByVal text As String) As String

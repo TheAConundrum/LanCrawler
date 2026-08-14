@@ -2,9 +2,13 @@
 from __future__ import annotations
 
 import ctypes
+import os
 import string
+import threading
 from ctypes import wintypes
 from pathlib import Path, PureWindowsPath
+
+DRIVE_REMOTE = 4
 
 BYTES_PER_MB = 1048576.0
 MIN_SIZE_MB = 0.01
@@ -75,6 +79,49 @@ def get_remote_name_for_drive(drive_with_colon: str) -> str:
     if err != ERROR_SUCCESS:
         return ""
     return remote.value.decode("ascii", errors="ignore").rstrip("\x00")
+
+
+def _root_is_reachable(root: str, timeout_sec: float = 20.0) -> bool:
+    """True if the drive root answers before timeout (disconnected maps can hang)."""
+    box: dict[str, bool] = {"ok": False}
+
+    def _check() -> None:
+        try:
+            box["ok"] = os.path.isdir(root)
+        except OSError:
+            box["ok"] = False
+
+    t = threading.Thread(target=_check, daemon=True)
+    t.start()
+    t.join(timeout_sec)
+    return bool(box["ok"])
+
+
+def list_mapped_network_drives() -> list[tuple[str, str, str]]:
+    """Mapped network drives: (letter like 'S:', root 'S:\\', UNC). Skips disconnected maps."""
+    if os.name != "nt":
+        return []
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_drive_type = kernel32.GetDriveTypeW
+    get_drive_type.argtypes = [wintypes.LPCWSTR]
+    get_drive_type.restype = wintypes.UINT
+
+    found: list[tuple[str, str, str]] = []
+    for letter in string.ascii_uppercase:
+        root = f"{letter}:\\"
+        try:
+            dtype = int(get_drive_type(root))
+        except Exception:
+            continue
+        if dtype != DRIVE_REMOTE:
+            continue
+        letter_colon = f"{letter}:"
+        if not _root_is_reachable(root):
+            continue
+        unc = get_remote_name_for_drive(letter_colon)
+        found.append((letter_colon, root, strip_trailing_slash(unc) if unc else letter_colon))
+    return found
 
 
 def build_drive_map(paths: list[str] | None = None) -> dict[str, str]:

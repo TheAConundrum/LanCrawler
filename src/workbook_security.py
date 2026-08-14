@@ -123,8 +123,17 @@ def enforce_workbook_ui_lock(wb: Any) -> None:
             _unlock_addr(d, addr)
         d.Columns(21).Locked = False  # U — hidden UNC targets
         d.Columns(21).Hidden = True
+        d.Columns(13).ColumnWidth = 10  # M Size MB
         _set_list_validation(d, "C3", "AND,OR,NOT")
-        _set_list_validation(d, "F3", "<,>")
+        _set_list_validation(d, "F3", "Over,Under")
+        try:
+            raw = str(d.Range("F3").Value or "").strip().upper()
+            if raw in (">", "GT", "GREATER THAN"):
+                d.Range("F3").Value = "Over"
+            elif raw in ("<", "LT", "LESS THAN"):
+                d.Range("F3").Value = "Under"
+        except Exception:
+            pass
         _set_list_validation(d, "H3", "Yes,No")
         _set_list_validation(d, "I3", "Yes,No,Only")
     except Exception as exc:

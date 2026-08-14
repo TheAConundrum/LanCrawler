@@ -23,7 +23,7 @@
         },
         {
             "label": "Crawl LAN folder (picker)",
-            "type": "shell",
+            "type": "process",
             "command": "${command:python.interpreterPath}",
             "args": [
                 "${workspaceFolder}\\src\\crawler\\run_crawl.py"
@@ -43,8 +43,29 @@
             "detail": "Crawl GUI → folder + AccDB-Blank workbook + Auto/Workbook/AccDB → exclusive index write."
         },
         {
+            "label": "SummitLANScan (all network drives)",
+            "type": "process",
+            "command": "${command:python.interpreterPath}",
+            "args": [
+                "${workspaceFolder}\\src\\crawler\\summit_lan_scan.py"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}\\src"
+            },
+            "problemMatcher": [],
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": true,
+                "panel": "dedicated",
+                "showReuseMessage": false,
+                "clear": true
+            },
+            "detail": "No picker: crawl every mapped network drive into AccDB (ReplaceRoot per drive)."
+        },
+        {
             "label": "Unlock workbook for layout edit",
-            "type": "shell",
+            "type": "process",
             "command": "${command:python.interpreterPath}",
             "args": [
                 "${workspaceFolder}\\src\\unlock_workbook.py",
@@ -66,7 +87,7 @@
         },
         {
             "label": "1. Run Python Inject",
-            "type": "shell",
+            "type": "process",
             "command": "${command:python.interpreterPath}",
             "args": [
                 "${workspaceFolder}\\src\\inject_vba.py",

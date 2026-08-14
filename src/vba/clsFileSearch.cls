@@ -195,7 +195,7 @@ Private Sub SearchIndex(ByVal hits As Object, ByRef anyCriteria As Boolean)
         Err.Raise vbObjectError + 1, , "NOT requires a second Contains keyword."
     End If
     If Len(sizeOp) > 0 And Not hasSizeFilter Then
-        Err.Raise vbObjectError + 2, , "Size filter incomplete (pick < or > and enter MB)."
+        Err.Raise vbObjectError + 2, , "Size filter incomplete (pick Over or Under and enter MB)."
     End If
 
     anyCriteria = True
@@ -271,21 +271,25 @@ Private Sub SearchAccdbCriteria(ByVal cn As Object, ByVal hits As Object, _
         path = Trim$(CStr(rs.Fields("FilePath").Value & ""))
         If Right$(path, 1) = "\" Then path = Left$(path, Len(path) - 1)
         If Len(path) > 0 Then
-            If flexible Then
+            et = UCase$(Trim$(CStr(rs.Fields("EntryType").Value & "")))
+            If Len(et) = 0 Then et = "FILE"
+            isFolder = (et = "FOLDER")
+            ' Folders: own name must match. SQL InStr on FilePath also hits descendants
+            ' of a matching ancestor (Pics, IM-000020, ...); drop those here.
+            If isFolder Then
+                If Not modPathUtil.FolderLeafMatchesCriteria(path, term1, op, term2, flexible, extraAndTerm) Then GoTo NextRec
+            ElseIf flexible Then
                 If Not FlexiblePathMatches(path, t1, op, t2) Then GoTo NextRec
                 If Len(extraN) > 0 Then
                     If InStr(1, modPathUtil.NormalizeForMatch(path), extraN, vbBinaryCompare) = 0 Then GoTo NextRec
                 End If
             End If
-            et = UCase$(Trim$(CStr(rs.Fields("EntryType").Value & "")))
-            If Len(et) = 0 Then et = "FILE"
-            isFolder = (et = "FOLDER")
             sizeVal = modPathUtil.CoerceStoredSizeMb(rs.Fields("SizeMB").Value)
             If hasSizeFilter Then
-                If sizeOp = ">" Then
-                    If Not (sizeVal > sizeMb) Then GoTo NextRec
-                ElseIf sizeOp = "<" Then
-                    If Not (sizeVal < sizeMb) Then GoTo NextRec
+                If sizeOp = "OVER" Then
+                    If Not (sizeVal >= sizeMb) Then GoTo NextRec
+                ElseIf sizeOp = "UNDER" Then
+                    If Not (sizeVal <= sizeMb) Then GoTo NextRec
                 End If
             End If
             dt = rs.Fields("FileDate").Value
@@ -352,10 +356,10 @@ Private Function BuildAccdbWhere(ByVal term1 As String, ByVal op As String, ByVa
 
     If hasSizeFilter Then
         ' Loose SQL prefilter (raw column). Authoritative match is CoerceStoredSizeMb post-filter.
-        If sizeOp = ">" Then
-            parts = parts & " AND [SizeMB]>" & Replace(CStr(sizeMb), ",", ".")
-        ElseIf sizeOp = "<" Then
-            parts = parts & " AND [SizeMB]<" & Replace(CStr(sizeMb), ",", ".")
+        If sizeOp = "OVER" Then
+            parts = parts & " AND [SizeMB]>=" & Replace(CStr(sizeMb), ",", ".")
+        ElseIf sizeOp = "UNDER" Then
+            parts = parts & " AND [SizeMB]<=" & Replace(CStr(sizeMb), ",", ".")
         End If
     End If
 
@@ -418,11 +422,12 @@ Private Function ParseSizeFilter(ByRef sizeOp As String, ByVal sizeValue As Vari
     Dim opNorm As String
     Dim raw As String
 
-    opNorm = Trim$(sizeOp)
-    If opNorm = "GREATER THAN" Or opNorm = "GT" Then opNorm = ">"
-    If opNorm = "LESS THAN" Or opNorm = "LT" Then opNorm = "<"
-
-    If opNorm <> "<" And opNorm <> ">" Then
+    opNorm = UCase$(Trim$(sizeOp))
+    If opNorm = "GREATER THAN" Or opNorm = "GT" Or opNorm = ">" Or opNorm = "OVER" Then
+        opNorm = "OVER"
+    ElseIf opNorm = "LESS THAN" Or opNorm = "LT" Or opNorm = "<" Or opNorm = "UNDER" Then
+        opNorm = "UNDER"
+    Else
         ParseSizeFilter = False
         Exit Function
     End If
@@ -582,35 +587,37 @@ Private Sub WriteResults(ByVal hits As Object)
         If isFolderHit Then
             folderCount = folderCount + 1
             groupFolderUnc = uncPath
-            If IsArray(meta) And UBound(meta) >= 4 Then
-                If CLng(meta(3) & 0) > 0 Or CLng(meta(4) & 0) > 0 Then
-                    displayName = modPathUtil.FileNameOnly(uncPath) & " (" & _
-                                  Format$(CLng(meta(3)), "#,##0") & " files, " & _
-                                  Format$(CLng(meta(4)), "#,##0") & " folders)"
-                Else
-                    displayName = modPathUtil.FileNameOnly(uncPath)
-                End If
-            Else
-                displayName = modPathUtil.FileNameOnly(uncPath)
-            End If
+            fileName = modPathUtil.FileNameOnly(uncPath)
+            fileType = "FOLDER"
+            displayName = "\" & fileName & "\"
             If i <= writeN Then
                 outFile(i, 1) = displayName
                 outLink(i, 1) = uncPath ' double-click opens this folder
-                outType(i, 1) = "FOLDER"
-                outSize(i, 1) = Round(CDbl(meta(1) & 0), 2)
+                outType(i, 1) = fileType
+                outSize(i, 1) = 0.01
+                If IsArray(meta) Then
+                    ' Recursive disk total of all files under this folder (indexed SizeMB).
+                    outSize(i, 1) = modPathUtil.CoerceStoredSizeMb(meta(1))
+                End If
                 outDate(i, 1) = Empty
-                If Not IsEmpty(meta(0)) Then
-                    On Error Resume Next
-                    outDate(i, 1) = DateValue(CDate(meta(0)))
-                    On Error GoTo 0
+                If IsArray(meta) Then
+                    If Not IsEmpty(meta(0)) Then
+                        On Error Resume Next
+                        outDate(i, 1) = DateValue(CDate(meta(0)))
+                        On Error GoTo 0
+                    End If
                 End If
             End If
-            totalSizeMb = totalSizeMb + Round(CDbl(meta(1) & 0), 2)
+            If IsArray(meta) Then
+                totalSizeMb = totalSizeMb + CDbl(modPathUtil.CoerceStoredSizeMb(meta(1)))
+            Else
+                totalSizeMb = totalSizeMb + 0.01
+            End If
         Else
             fileCount = fileCount + 1
             fileName = modPathUtil.FileNameOnly(uncPath)
-            displayName = fileName
             fileType = modPathUtil.FileExtension(fileName)
+            displayName = AppendTypeToFileName(fileName, fileType)
             groupFolderUnc = modPathUtil.ParentFolderPath(uncPath)
             If Right$(groupFolderUnc, 1) = "\" Then groupFolderUnc = Left$(groupFolderUnc, Len(groupFolderUnc) - 1)
 
@@ -644,6 +651,9 @@ Private Sub WriteResults(ByVal hits As Object)
                 ' Resolve drive label only when the folder group changes (was per-row Shell/WNet)
                 groupDrive = modIndexCache.FriendlyLabelForShare(groupFolderUnc)
                 groupFolderDisplay = modPathUtil.ToDisplayPath(groupFolderUnc)
+                If isFolderHit Then
+                    If Right$(groupFolderDisplay, 1) <> "\" Then groupFolderDisplay = groupFolderDisplay & "\"
+                End If
                 outDrive(i, 1) = groupDrive
                 outFolder(i, 1) = groupFolderDisplay
                 prevFolderKey = groupFolderUnc
@@ -657,8 +667,8 @@ Private Sub WriteResults(ByVal hits As Object)
     Set sizeRng = ws.Range(ws.Cells(firstDataRow, sizeCol), ws.Cells(firstDataRow + writeN - 1, sizeCol))
     Set fileRng = ws.Range(ws.Cells(firstDataRow, fileCol), ws.Cells(firstDataRow + writeN - 1, fileCol))
     sizeRng.NumberFormat = "0.00"
-
-    fileRng.Value2 = outFile
+    ' Do not format A8:An as a block (collapses A:K row merges). File cells are "@" from the grid.
+    fileRng.Value = outFile
     ws.Range(ws.Cells(firstDataRow, typeCol), ws.Cells(firstDataRow + writeN - 1, typeCol)).Value2 = outType
     sizeRng.Value2 = outSize
     ws.Range(ws.Cells(firstDataRow, dateCol), ws.Cells(firstDataRow + writeN - 1, dateCol)).NumberFormat = "yyyy-mmm-dd"
@@ -701,6 +711,27 @@ Private Sub WriteSearchStats(ByVal fileCount As Long, ByVal folderCount As Long,
     ws.Range(mMap.StatSizeValueAddress).Value = totalSizeMb
     On Error GoTo 0
 End Sub
+
+Private Function AppendTypeToFileName(ByVal fileName As String, ByVal fileType As String) As String
+    Dim n As String
+    Dim t As String
+
+    n = Trim$(fileName)
+    t = UCase$(Trim$(fileType))
+    If Len(n) = 0 Then
+        AppendTypeToFileName = n
+        Exit Function
+    End If
+    If Len(t) = 0 Then
+        AppendTypeToFileName = n
+        Exit Function
+    End If
+    If Right$(UCase$(n), Len(t) + 1) = "." & t Then
+        AppendTypeToFileName = n
+    Else
+        AppendTypeToFileName = n & "." & t
+    End If
+End Function
 
 Private Function ResultSortKey(ByVal uncPath As String, ByVal meta As Variant) As String
     Dim folderUnc As String

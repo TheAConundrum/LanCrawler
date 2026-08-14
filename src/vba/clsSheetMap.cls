@@ -39,7 +39,7 @@ Private Const ADDR_SUM_SIZE_VAL As String = "E5"
 
 ' Dashboard layout (user-owned chrome):
 ' Row 2 = criteria headers; row 3 = Contains A3:B3 | Op C3 | Contains D3:E3
-'         Size is F3 (<> dropdown) | MB G3 (number) | Flexible H3 | Search folders I3
+'         Size is F3 (Over/Under) | MB G3 (number) | Flexible H3 | Search folders I3
 ' Row 4 = File Search / Drive labels; row 5 = File Search A5:G5 | Drive H5:I5
 ' Search stats values M3 / M4 / M5 (merged M:N); row 6 divider;
 ' Results headers row 7; data row 8+.
@@ -49,7 +49,7 @@ Private Const CRITERIA_LAST_ROW As Long = 3
 Private Const CRITERIA_COL_TERM1 As Long = 1 ' A (merged A3:B3)
 Private Const CRITERIA_COL_OP As Long = 3    ' C And/Or/Not
 Private Const CRITERIA_COL_TERM2 As Long = 4 ' D (merged D3:E3)
-Private Const CRITERIA_COL_SIZE_OP As Long = 6 ' F Size is (<>) — not merged with G
+Private Const CRITERIA_COL_SIZE_OP As Long = 6 ' F Size is (Over/Under)
 Private Const CRITERIA_COL_SIZE_MB As Long = 7 ' G MB number
 Private Const ADDR_TERM1 As String = "A3"
 Private Const ADDR_OP As String = "C3"
@@ -436,6 +436,7 @@ Private Sub BuildResultsDisplayGridCore(ByVal ws As Worksheet, ByVal firstRow As
         End If
         ' Format per row — never Range(A8:A20007).* (Excel collapses A:K into A8:A20007)
         With ws.Cells(r, RESULTS_FILE_COL)
+            .NumberFormat = "@"
             .HorizontalAlignment = xlLeft
             .Font.Color = RGB(5, 99, 193)
             .Font.Underline = xlUnderlineStyleSingle
@@ -638,29 +639,44 @@ Private Sub ProtectDashboardSheet()
     UnprotectSheet ws
     On Error Resume Next
 
-    ws.Cells.Locked = True
-    ' Free-text: Contains A3:B3, Contains D3:E3, Size MB G3, File Search A5:F5
-    UnlockMergeOrRange ws, ADDR_TERM1
-    UnlockMergeOrRange ws, ADDR_TERM2
-    UnlockMergeOrRange ws, ADDR_SIZE_MB
-    UnlockMergeOrRange ws, ADDR_FILE_SEARCH
-    ' Dropdowns: Op C3, Size is F3, Flexible H3, Folders I3, Drive H5
-    UnlockMergeOrRange ws, ADDR_OP
-    UnlockMergeOrRange ws, ADDR_SIZE_OP
-    UnlockMergeOrRange ws, ADDR_FLEXIBLE_MATCH
-    UnlockMergeOrRange ws, ADDR_SEARCH_FOLDERS
-    UnlockMergeOrRange ws, ADDR_DRIVE_FILTER
-    ' Hidden UNC targets must be readable while sheet is protected
-    ws.Columns(RESULTS_LINK_COL).Locked = False
-    EnsureLinkColumnHidden ws
-
-    ' Unlock results body so AutoFilter Sort can rearrange rows under protect
-    UnlockResultsDataArea ws
+    ' Cells.Locked=True on every protect would re-lock merged results and bring
+    ' back Excel's protect dialog on click. Do the lock map once per session.
+    If Not gResultsCopyUnlockDone Then
+        ws.Cells.Locked = True
+        ' Free-text: Contains A3:B3, Contains D3:E3, Size MB G3, File Search A5:F5
+        UnlockMergeOrRange ws, ADDR_TERM1
+        UnlockMergeOrRange ws, ADDR_TERM2
+        UnlockMergeOrRange ws, ADDR_SIZE_MB
+        UnlockMergeOrRange ws, ADDR_FILE_SEARCH
+        ' Dropdowns: Op C3, Size is F3, Flexible H3, Folders I3, Drive H5
+        UnlockMergeOrRange ws, ADDR_OP
+        UnlockMergeOrRange ws, ADDR_SIZE_OP
+        UnlockMergeOrRange ws, ADDR_FLEXIBLE_MATCH
+        UnlockMergeOrRange ws, ADDR_SEARCH_FOLDERS
+        UnlockMergeOrRange ws, ADDR_DRIVE_FILTER
+        ws.Columns(RESULTS_LINK_COL).Locked = False
+        EnsureLinkColumnHidden ws
+        UnlockResultsDataArea ws
+        gResultsCopyUnlockDone = True
+    Else
+        UnlockMergeOrRange ws, ADDR_TERM1
+        UnlockMergeOrRange ws, ADDR_TERM2
+        UnlockMergeOrRange ws, ADDR_SIZE_MB
+        UnlockMergeOrRange ws, ADDR_FILE_SEARCH
+        UnlockMergeOrRange ws, ADDR_OP
+        UnlockMergeOrRange ws, ADDR_SIZE_OP
+        UnlockMergeOrRange ws, ADDR_FLEXIBLE_MATCH
+        UnlockMergeOrRange ws, ADDR_SEARCH_FOLDERS
+        UnlockMergeOrRange ws, ADDR_DRIVE_FILTER
+        EnsureLinkColumnHidden ws
+    End If
 
     ApplyCriteriaOperatorValidation
     ApplyOptionDropdownValidation
 
+    ws.Columns(RESULTS_SIZE_COL).ColumnWidth = 10
     CaptureDashboardFixedColumnWidthsIfNeeded ws
+    modEntryPoints.SetDashboardFixedWidth RESULTS_SIZE_COL, 10
     RestoreDashboardFixedColumnWidths ws
 
     ' Filter only if missing — do not tear down/rebuild (corrupts File row merges)
@@ -672,15 +688,27 @@ Private Sub ProtectDashboardSheet()
 End Sub
 
 Private Sub UnlockResultsDataArea(ByVal ws As Worksheet)
+    Dim r As Long
     Dim firstRow As Long
     Dim lastRow As Long
+
     If ws Is Nothing Then Exit Sub
     firstRow = RESULTS_HEADER_ROW + 1
     lastRow = firstRow + RESULTS_MAX_ROWS - 1
     On Error Resume Next
-    ' Unlock Type..Drive only — never Locked=False on A8:A20007 / A8:T20007 (collapses A:K row merges)
+    ' Non-merged Type..Drive can be a block
     ws.Range(ws.Cells(firstRow, RESULTS_TYPE_COL), ws.Cells(lastRow, RESULTS_DRIVE_COL)).Locked = False
     ws.Columns(RESULTS_LINK_COL).Locked = False
+    ' Per-row only — a tall A8:A20007 / P8:P20007 unlock collapses the merges
+    For r = firstRow To lastRow
+        ws.Cells(r, RESULTS_FILE_COL).MergeArea.Locked = False
+        ws.Cells(r, RESULTS_FOLDER_COL).MergeArea.Locked = False
+        If r Mod 2000 = 0 Then
+            Application.StatusBar = "LAN Search: enabling results copy " & CStr(r - firstRow + 1) & "/" & CStr(RESULTS_MAX_ROWS)
+            DoEvents
+        End If
+    Next r
+    Application.StatusBar = False
     On Error GoTo 0
 End Sub
 
@@ -864,14 +892,22 @@ Public Sub ApplyCriteriaOperatorValidation()
     On Error GoTo 0
     With rng.Validation
         .Add Type:=xlValidateList, AlertStyle:=xlValidAlertStop, Operator:=xlBetween, _
-             Formula1:="<,>"
+             Formula1:="Over,Under"
         .IgnoreBlank = True
         .InCellDropdown = True
         .ShowInput = False
         .ShowError = True
         .ErrorTitle = "Size"
-        .ErrorMessage = "Pick < or > from the list (or leave blank)."
+        .ErrorMessage = "Pick Over or Under from the list (or leave blank)."
     End With
+
+    ' Migrate leftover < / > from older workbooks
+    On Error Resume Next
+    Select Case UCase$(Trim$(CStr(rng.Value & "")))
+        Case ">", "GT", "GREATER THAN": rng.Value = "Over"
+        Case "<", "LT", "LESS THAN": rng.Value = "Under"
+    End Select
+    On Error GoTo 0
 End Sub
 
 ' Flexible match / Search folders — list pick only (Stop blocks free typing).

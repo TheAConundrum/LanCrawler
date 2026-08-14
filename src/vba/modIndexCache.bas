@@ -302,13 +302,6 @@ Public Sub CollectPathHits(ByVal term1 As String, ByVal op As String, ByVal term
     Dim isFolder As Boolean
     Dim sizeVal As Double
     Dim dt As Variant
-    Dim term1N As String
-    Dim term2N As String
-    Dim extraN As String
-    Dim hay As String
-    Dim hasTerm2 As Boolean
-    Dim has1 As Boolean
-    Dim has2 As Boolean
     Dim matched As Boolean
     Dim filterShare As String
     Dim share As String
@@ -318,16 +311,7 @@ Public Sub CollectPathHits(ByVal term1 As String, ByVal op As String, ByVal term
     term1 = Trim$(term1)
     term2 = Trim$(term2)
     op = UCase$(Trim$(op))
-    hasTerm2 = (Len(term2) > 0 And Len(op) > 0)
     filterShare = Trim$(shareFilter)
-    extraN = Trim$(extraAndTerm)
-
-    If flexible Then
-        term1N = modPathUtil.NormalizeForMatch(term1)
-        If hasTerm2 Then term2N = modPathUtil.NormalizeForMatch(term2)
-        If Len(extraN) > 0 Then extraN = modPathUtil.NormalizeForMatch(extraN)
-        If Len(term1N) = 0 Then Exit Sub
-    End If
 
     For i = 1 To mRowCount
         path = CStr(mData(i, 1) & "")
@@ -348,30 +332,12 @@ Public Sub CollectPathHits(ByVal term1 As String, ByVal op As String, ByVal term
             If Not includeFiles Then GoTo NextRow
         End If
 
-        If flexible Then
-            hay = modPathUtil.NormalizeForMatch(path)
-            has1 = (InStr(1, hay, term1N, vbBinaryCompare) > 0)
-            If hasTerm2 Then
-                has2 = (InStr(1, hay, term2N, vbBinaryCompare) > 0)
-                matched = CombineMatch(has1, has2, op)
-            Else
-                matched = has1
-            End If
-            If matched And Len(extraN) > 0 Then
-                matched = (InStr(1, hay, extraN, vbBinaryCompare) > 0)
-            End If
+        ' Folders: match the folder's own name only (not ancestor names in the path).
+        ' Files: still match the full path so hits under a named folder remain visible.
+        If isFolder Then
+            matched = modPathUtil.FolderLeafMatchesCriteria(path, term1, op, term2, flexible, extraAndTerm)
         Else
-            hay = path
-            has1 = (InStr(1, hay, term1, vbTextCompare) > 0)
-            If hasTerm2 Then
-                has2 = (InStr(1, hay, term2, vbTextCompare) > 0)
-                matched = CombineMatch(has1, has2, op)
-            Else
-                matched = has1
-            End If
-            If matched And Len(extraAndTerm) > 0 Then
-                matched = (InStr(1, hay, Trim$(extraAndTerm), vbTextCompare) > 0)
-            End If
+            matched = modPathUtil.TextMatchesCriteria(path, term1, op, term2, flexible, extraAndTerm)
         End If
         If Not matched Then GoTo NextRow
 
@@ -894,25 +860,12 @@ Private Sub SortStringsAz(ByRef values() As String, ByVal lo As Long, ByVal hi A
     If i < hi Then SortStringsAz values, i, hi
 End Sub
 
-Private Function CombineMatch(ByVal has1 As Boolean, ByVal has2 As Boolean, ByVal op As String) As Boolean
-    Select Case op
-        Case "AND"
-            CombineMatch = has1 And has2
-        Case "OR"
-            CombineMatch = has1 Or has2
-        Case "NOT"
-            CombineMatch = has1 And (Not has2)
-        Case Else
-            CombineMatch = has1
-    End Select
-End Function
-
 Private Function SizeMatchesLocal(ByVal fileMb As Double, ByVal sizeOp As String, ByVal sizeMb As Double) As Boolean
-    Select Case sizeOp
-        Case ">"
-            SizeMatchesLocal = (fileMb > sizeMb)
-        Case "<"
-            SizeMatchesLocal = (fileMb < sizeMb)
+    Select Case UCase$(Trim$(sizeOp))
+        Case "OVER", ">"
+            SizeMatchesLocal = (fileMb >= sizeMb)
+        Case "UNDER", "<"
+            SizeMatchesLocal = (fileMb <= sizeMb)
         Case Else
             SizeMatchesLocal = True
     End Select

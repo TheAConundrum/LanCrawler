@@ -11,6 +11,8 @@ Option Explicit
 
 ' When True, WarmIndexCache will not re-apply UI lock (layout edit session).
 Public gLayoutEditMode As Boolean
+' Results A:K / P:T merges are unlocked for select+copy; skip the 20k pass until relock.
+Public gResultsCopyUnlockDone As Boolean
 
 ' Dashboard columns that stay fixed width while AllowFormattingColumns is on:
 ' A:G, H:J, L:N (session snapshot; K and O+ remain user-resizable).
@@ -112,6 +114,7 @@ Public Sub UnlockForLayoutEdit()
     wb.Worksheets("Dashboard").Activate
     ' Re-capture column snaps on next lock (include G / exclude K)
     DashboardFixedWidthsReady = False
+    gResultsCopyUnlockDone = False
     Debug.Print "LAYOUT EDIT: unlocked all sheets; gLayoutEditMode=True"
     On Error GoTo 0
 End Sub
@@ -119,6 +122,7 @@ End Sub
 Public Sub RelockAfterLayoutEdit()
     Dim map As clsSheetMap
     gLayoutEditMode = False
+    gResultsCopyUnlockDone = False
     Set map = ReadySheetMap()
     map.ProtectWorkbookUi
     Debug.Print "LAYOUT EDIT: relocked; gLayoutEditMode=False"
@@ -193,6 +197,36 @@ Fail:
     Debug.Print "SEARCH: double-click handler Err=" & CStr(Err.Number) & " " & Err.Description
     Cancel = True
 End Function
+
+' Results cells are unlocked so select/copy does not hit Excel's protect dialog
+' (locked merged A:K / P:T). Revert any user edit; VBA writes run with events off.
+Public Sub RejectDashboardResultsEdit(ByVal Sh As Object, ByVal Target As Range)
+    Dim map As clsSheetMap
+    Dim rng As Range
+    Dim firstData As Long
+    Dim lastData As Long
+
+    If gLayoutEditMode Then Exit Sub
+    If Sh Is Nothing Or Target Is Nothing Then Exit Sub
+    If StrComp(Sh.Name, "Dashboard", vbTextCompare) <> 0 Then Exit Sub
+
+    Set map = New clsSheetMap
+    map.Init Sh.Parent
+    firstData = map.ResultsFirstDataRow
+    lastData = firstData + map.ResultsMaxRows - 1
+
+    On Error Resume Next
+    Set rng = Intersect(Target, Sh.Range(Sh.Cells(firstData, map.ResultsFileCol), _
+                                         Sh.Cells(lastData, map.ResultsLastCol)))
+    On Error GoTo 0
+    If rng Is Nothing Then Exit Sub
+
+    On Error Resume Next
+    Application.EnableEvents = False
+    Application.Undo
+    Application.EnableEvents = True
+    On Error GoTo 0
+End Sub
 
 Public Sub ResetStatusBar()
     ' Never leave the literal word FALSE — only Boolean False returns the bar to Excel.
