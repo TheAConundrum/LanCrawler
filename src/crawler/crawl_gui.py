@@ -42,7 +42,7 @@ def run_crawl_gui(
     folder_var = tk.StringVar(value="")
     wb_default = Path(initial_workbook) if initial_workbook else _default_workbook()
     workbook_var = tk.StringVar(value=str(wb_default) if wb_default.is_file() else "")
-    mode_var = tk.StringVar(value="Auto")
+    mode_var = tk.StringVar(value="AccDB")
     result: dict[str, CrawlGuiResult | None] = {"value": None}
 
     def browse_folder() -> None:
@@ -67,7 +67,7 @@ def run_crawl_gui(
     def on_start() -> None:
         folder = folder_var.get().strip()
         workbook = workbook_var.get().strip()
-        mode = mode_var.get().strip() or "Auto"
+        mode = mode_var.get().strip() or "AccDB"
         if not folder:
             messagebox.showwarning("Missing folder", "Select a folder or drive to crawl.")
             return
@@ -78,12 +78,12 @@ def run_crawl_gui(
             messagebox.showerror("Workbook not found", f"File not found:\n{workbook}")
             return
         if mode not in ("Auto", "Workbook", "AccDB"):
-            mode = "Auto"
+            mode = "AccDB"
         result["value"] = CrawlGuiResult(root=folder, workbook=workbook, target_mode=mode)
         root_win.destroy()
 
     def on_cancel() -> None:
-        result["value"] = CrawlGuiResult(root="", workbook="", target_mode="Auto", cancelled=True)
+        result["value"] = CrawlGuiResult(root="", workbook="", target_mode="AccDB", cancelled=True)
         root_win.destroy()
 
     padx = 10
@@ -102,6 +102,12 @@ def run_crawl_gui(
     ttk.Label(frm, text="Index target").grid(row=4, column=0, sticky="w", padx=padx, pady=pady)
     mode_frm = ttk.Frame(frm)
     mode_frm.grid(row=5, column=0, columnspan=2, sticky="w", padx=padx, pady=pady)
+    ttk.Radiobutton(
+        mode_frm,
+        text="AccDB (DB\\LAN_Search_Index.accdb beside workbook) — default",
+        variable=mode_var,
+        value="AccDB",
+    ).pack(anchor="w")
     ttk.Radiobutton(mode_frm, text="Auto (sheet under 750k; AccDB if larger)", variable=mode_var, value="Auto").pack(
         anchor="w"
     )
@@ -110,12 +116,6 @@ def run_crawl_gui(
         text="Workbook (Database!tblFiles) — forced to AccDB above 750k",
         variable=mode_var,
         value="Workbook",
-    ).pack(anchor="w")
-    ttk.Radiobutton(
-        mode_frm,
-        text="AccDB (DB\\LAN_Search_Index.accdb beside workbook)",
-        variable=mode_var,
-        value="AccDB",
     ).pack(anchor="w")
 
     btn_frm = ttk.Frame(frm)
@@ -128,5 +128,5 @@ def run_crawl_gui(
 
     value = result["value"]
     if value is None:
-        return CrawlGuiResult(root="", workbook="", target_mode="Auto", cancelled=True)
+        return CrawlGuiResult(root="", workbook="", target_mode="AccDB", cancelled=True)
     return value

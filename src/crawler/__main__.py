@@ -156,8 +156,8 @@ def main(argv: list[str] | None = None) -> int:
     if use_accdb:
         if accdb_path is None:
             raise SystemExit("AccDB path required (--accdb or --import-excel for relative DB path)")
-        write_accdb(rows, accdb_path)
-        print(f"Wrote AccDB {accdb_path}")
+        write_accdb(rows, accdb_path, crawl_root=unc)
+        print(f"Wrote AccDB {accdb_path} (tblFiles + tblIngested)")
         if args.import_excel is not None:
             from crawler.import_to_excel import clear_onboard_tblfiles
 

@@ -28,6 +28,7 @@ if str(SRC_DIR) not in sys.path:
 
 from workbook_security import (  # noqa: E402
     enforce_workbook_ui_lock,
+    reopen_workbook_in_app,
     vba_project_is_locked,
 )
 
@@ -185,10 +186,6 @@ def close_if_open(target_file: Path) -> None:
                 print(f"Closing existing instance of {book.name}...")
                 _silence_app(existing_app)
                 try:
-                    existing_app.visible = False
-                except Exception:
-                    pass
-                try:
                     book.save()
                 except Exception:
                     pass
@@ -196,10 +193,12 @@ def close_if_open(target_file: Path) -> None:
                     book.close()
                 except Exception:
                     pass
-                # Quit this Excel if it has no books left (avoids orphan hidden apps)
+                # Only quit this Excel if it has no books left — restore UI first
                 try:
                     if len(existing_app.books) == 0:
-                        existing_app.quit()
+                        from workbook_security import soft_quit_excel_app
+
+                        soft_quit_excel_app(existing_app)
                 except Exception:
                     pass
 
@@ -296,7 +295,7 @@ def inject_vba(target_file: Path, source_dir: Path, reopen: bool = True) -> None
         if vba_project_is_locked(wb):
             raise RuntimeError(
                 "VBA project is password-protected. Unlock it once in the VBE "
-                "(Tools → VBAProject Properties → Protection), save the workbook, "
+                "(Tools > VBAProject Properties > Protection), save the workbook, "
                 "then re-run inject. Sheet data import does not need this unlock."
             )
 
@@ -317,52 +316,32 @@ def inject_vba(target_file: Path, source_dir: Path, reopen: bool = True) -> None
         wb.save()
 
         if reopen:
-            # Stay hidden/frozen through close+reopen so Workbook_Open can fire
-            # without flashing intermediate windows.
             saved_path = str(target_file.resolve())
-            print("Reopening workbook (still frozen → then show once)...")
+            print("Reopening workbook in same Excel (Workbook_Open / cache warm)...")
+            reopen_workbook_in_app(app, saved_path)
+            app = None  # leave Excel running for the user — do not Quit
+            print("Update complete. Excel is open.")
+        else:
+            from workbook_security import soft_quit_excel_app  # noqa: E402
+
             try:
                 wb.close()
             except Exception:
                 pass
-            wb = None
-
-            # Events on before open so Workbook_Open schedules cache warm
-            try:
-                app.enable_events = True
-                app.api.EnableEvents = True
-            except Exception:
-                pass
-            # Keep screen frozen and hidden until open finishes
-            try:
-                app.screen_updating = False
-                app.visible = False
-            except Exception:
-                pass
-
-            wb = app.books.open(saved_path)
-            try:
-                wb.activate()
-            except Exception:
-                pass
-
-            # Single reveal at the end
-            try:
-                app.visible = True
-            except Exception:
-                pass
-            _unsilence_app(app)
-            print("Update complete. Excel is open.")
-            app = None  # do not quit in finally
-        else:
-            wb.close()
-            print("Update complete. Excel closed.")
+            soft_quit_excel_app(app)
+            app = None
+            print("Update complete. Excel closed cleanly.")
     finally:
         if app is not None:
             try:
-                app.quit()
+                from workbook_security import soft_quit_excel_app  # noqa: E402
+
+                soft_quit_excel_app(app)
             except Exception:
-                pass
+                try:
+                    app.quit()
+                except Exception:
+                    pass
 
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)

@@ -113,7 +113,10 @@ Results: **A:K** File (blue; **double-click** opens folder) | **L** File Type | 
 ### AccDB (beside workbook)
 
 - Path: `{workbook folder}\DB\LAN_Search_Index.accdb`
-- Same `tblFiles` schema; indexes on `FilePath` and `EntryType`
+- `tblFiles`: same schema as sheet; indexes on `FilePath` and `EntryType`
+- `tblIngested`: one row per crawl root (RootPath | DateIngested | FileCount | FolderCount | TotalSizeMB); accumulates across AccDB ReplaceRoot crawls
+- On AccDB resolve / cache warm, VBA replaces **Ingestion!tblIngested** + **E2:E5** with AccDB’s scan list only
+- If AccDB is deleted, next warm/search clears Ingestion history
 - Requires ACE on each PC that searches AccDB
 
 ## Index filter (docs + images + parent archives)
@@ -145,7 +148,7 @@ python -m crawler "O:\Some Folder" -w 16 --import-excel "..\AccDB-Blank_LAN_Craw
 
 ## Search performance
 
-`Workbook_Open` schedules deferred `ResolveIndexBackend` (~2s). Sheet backend loads a slim `tblFiles` cache; AccDB opens on demand via late-bound ADODB. Results write into the prebuilt 5000-row grid. Immediate Window shows `SEARCH` / `INDEX` diagnostics.
+`Workbook_Open` schedules deferred `ResolveIndexBackend` (~2s). Sheet backend loads a slim `tblFiles` cache; AccDB opens on demand via late-bound ADODB. Results write into the prebuilt 20000-row grid. Immediate Window shows `SEARCH` / `INDEX` diagnostics.
 
 ## Notes
 

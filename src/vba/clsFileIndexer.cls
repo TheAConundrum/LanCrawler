@@ -225,53 +225,95 @@ Fail:
     IndexRootSilent = -1
 End Function
 
-Public Sub RefreshIngestedListFromDatabase()
+' Replace Links already Eaten from AccDB tblIngested (or synthesized summary).
+' logRows: 1-based (1 To rowCount, 1 To 5) RootPath | DateIngested | FileCount | FolderCount | TotalSizeMB
+Public Sub ReplaceIngestedLog(ByRef logRows As Variant, ByVal rowCount As Long)
     Dim tbl As ListObject
-    Dim files As ListObject
-    Dim r As Long
-    Dim root As String
-    Dim found As Boolean
-    Dim cell As Range
+    Dim lr As ListRow
+    Dim i As Long
+    Dim whenVal As Variant
 
     On Error GoTo Fail
-    mApp.BeginFast
+    If mMap Is Nothing Then Exit Sub
+
     mMap.UnprotectWorkbookForWrite
-
+    ClearSheetFilters mMap.Ingestion
     Set tbl = GetOrCreateIngestedTable()
-    Set files = GetFilesTable()
 
-    If tbl.DataBodyRange Is Nothing Then
-        mMap.ProtectWorkbookUi
-        mApp.Restore
-        MsgBox "Links already Eaten is empty.", vbInformation, "LAN Search"
-        Exit Sub
+    Do While tbl.ListRows.Count > 0
+        tbl.ListRows(1).Delete
+    Loop
+
+    If rowCount > 0 And IsArray(logRows) Then
+        For i = 1 To rowCount
+            Set lr = tbl.ListRows.Add
+            lr.Range.Cells(1, 1).Value = CStr(logRows(i, 1) & "")
+            whenVal = logRows(i, 2)
+            If IsDate(whenVal) Then
+                lr.Range.Cells(1, 2).Value = CDate(whenVal)
+            ElseIf Len(Trim$(CStr(whenVal & ""))) > 0 Then
+                If IsDate(CStr(whenVal)) Then
+                    lr.Range.Cells(1, 2).Value = CDate(CStr(whenVal))
+                Else
+                    lr.Range.Cells(1, 2).Value = CStr(whenVal)
+                End If
+            Else
+                lr.Range.Cells(1, 2).Value = Date
+            End If
+            lr.Range.Cells(1, 3).Value = CLng(Val(CStr(logRows(i, 3) & "")))
+            lr.Range.Cells(1, 4).Value = CLng(Val(CStr(logRows(i, 4) & "")))
+            lr.Range.Cells(1, 5).Value = Round(Val(CStr(logRows(i, 5) & "")), 2)
+        Next i
     End If
 
-    For r = tbl.DataBodyRange.Rows.Count To 1 Step -1
-        root = CStr(tbl.DataBodyRange.Cells(r, 1).Value & "")
-        found = False
-        If Not files Is Nothing Then
-            If Not files.DataBodyRange Is Nothing Then
-                For Each cell In files.ListColumns(1).DataBodyRange.Cells
-                    If modPathUtil.PathStartsWithRoot(CStr(cell.Value & ""), root) Then
-                        found = True
-                        Exit For
-                    End If
-                Next cell
-            End If
-        End If
-        If Not found Then tbl.ListRows(r).Delete
-    Next r
-
     SortIngestedTable
-    RefreshIngestedSummary
+    ApplyIngestedColumnFormats tbl
+    RefreshIngestedSummary tbl
     mMap.ProtectWorkbookUi
-    mApp.Restore
-    MsgBox "Ingested list refreshed.", vbInformation, "LAN Search"
     Exit Sub
 
 Fail:
-    ReportFailure "RefreshIngestedList"
+    On Error Resume Next
+    If Not mMap Is Nothing Then mMap.ProtectWorkbookUi
+    Debug.Print "INGEST: ReplaceIngestedLog failed " & Err.Description
+End Sub
+
+Public Sub RemoveSyntheticAccdbIngestRows()
+    Dim tbl As ListObject
+    Dim r As Long
+    Dim root As String
+    Dim removed As Long
+
+    On Error GoTo Fail
+    If mMap Is Nothing Then Exit Sub
+    mMap.UnprotectWorkbookForWrite
+    ClearSheetFilters mMap.Ingestion
+    Set tbl = GetOrCreateIngestedTable()
+    If tbl.DataBodyRange Is Nothing Then
+        mMap.ProtectWorkbookUi
+        Exit Sub
+    End If
+
+    removed = 0
+    For r = tbl.ListRows.Count To 1 Step -1
+        root = Trim$(CStr(tbl.DataBodyRange.Cells(r, 1).Value & ""))
+        If StrComp(root, "(AccDB index)", vbTextCompare) = 0 Then
+            tbl.ListRows(r).Delete
+            removed = removed + 1
+        End If
+    Next r
+
+    If removed > 0 Then
+        RefreshIngestedSummary tbl
+        Debug.Print "INGEST: removed synthetic AccDB index rows=" & CStr(removed)
+    End If
+    mMap.ProtectWorkbookUi
+    Exit Sub
+
+Fail:
+    On Error Resume Next
+    If Not mMap Is Nothing Then mMap.ProtectWorkbookUi
+    Debug.Print "INGEST: RemoveSyntheticAccdbIngestRows failed " & Err.Description
 End Sub
 
 Private Sub CrawlIterative(ByVal startFolder As String)

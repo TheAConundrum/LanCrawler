@@ -5,11 +5,15 @@ Option Explicit
 '   RunIndexFromIngestion
 '   RunSearchFromDashboard
 ' WarmIndexCache is Public for Application.OnTime (Workbook_Open) — not for buttons.
+' UnlockForLayoutEdit / RelockAfterLayoutEdit — Dashboard chrome editing.
 '
 ' Helpers: modPathUtil, modIndexCache (Option Private Module).
 
+' When True, WarmIndexCache will not re-apply UI lock (layout edit session).
+Public gLayoutEditMode As Boolean
+
 ' Dashboard columns that stay fixed width while AllowFormattingColumns is on:
-' A:F, H:J, L:N (session snapshot; G/K/O+ remain user-resizable).
+' A:G, H:J, L:N (session snapshot; K and O+ remain user-resizable).
 Private mDashFixedW(1 To 14) As Double
 Private mDashFixedWReady As Boolean
 
@@ -61,17 +65,63 @@ End Sub
 Public Sub WarmIndexCache()
     Dim map As clsSheetMap
     On Error GoTo QuietFail
-    Debug.Print "INDEX CACHE: WarmIndexCache OnTime fired"
+    Debug.Print "INDEX CACHE: WarmIndexCache OnTime fired layoutEdit=" & CStr(gLayoutEditMode)
     Application.EnableEvents = True
-    modIndexCache.WarmIndexIfNeeded ActiveWorkbook
     Set map = ReadySheetMap()
-    map.EnsureResultsDisplayGrid
-    map.ProtectDashboardResults
+    ' Clear prior hits only — never rebuild results merges/stripes on open
+    map.ResetResultsAreaOnOpen
+    modIndexCache.WarmIndexIfNeeded ActiveWorkbook
+    If Not gLayoutEditMode Then
+        map.ProtectDashboardResults
+    Else
+        Debug.Print "INDEX CACHE: skipping UI lock (layout edit mode)"
+    End If
     ResetStatusBar
     Exit Sub
 QuietFail:
     Debug.Print "INDEX CACHE: WarmIndexCache failed Err=" & CStr(Err.Number) & " " & Err.Description
     ResetStatusBar
+End Sub
+
+' Fully unlock sheets for Dashboard text/merge edits. WarmIndex will not re-lock
+' until RelockAfterLayoutEdit (or workbook reopen without this flag).
+Public Sub UnlockForLayoutEdit()
+    Dim map As clsSheetMap
+    Dim ws As Worksheet
+    Dim wb As Workbook
+
+    On Error Resume Next
+    gLayoutEditMode = True
+    Set wb = ActiveWorkbook
+    If wb Is Nothing Then Exit Sub
+
+    Set map = New clsSheetMap
+    map.Init wb
+    map.UnprotectWorkbookForWrite
+
+    For Each ws In wb.Worksheets
+        ws.Unprotect Password:=vbNullString
+        ws.Unprotect
+        ws.Cells.Locked = False
+        ws.EnableSelection = xlNoRestrictions
+        If StrComp(ws.Name, "Database", vbTextCompare) = 0 Then
+            ws.Visible = xlSheetVisible
+        End If
+    Next ws
+
+    wb.Worksheets("Dashboard").Activate
+    ' Re-capture column snaps on next lock (include G / exclude K)
+    DashboardFixedWidthsReady = False
+    Debug.Print "LAYOUT EDIT: unlocked all sheets; gLayoutEditMode=True"
+    On Error GoTo 0
+End Sub
+
+Public Sub RelockAfterLayoutEdit()
+    Dim map As clsSheetMap
+    gLayoutEditMode = False
+    Set map = ReadySheetMap()
+    map.ProtectWorkbookUi
+    Debug.Print "LAYOUT EDIT: relocked; gLayoutEditMode=False"
 End Sub
 
 ' Double-click File name → open containing folder (Explorer).
@@ -145,9 +195,9 @@ Fail:
 End Function
 
 Public Sub ResetStatusBar()
+    ' Never leave the literal word FALSE — only Boolean False returns the bar to Excel.
     On Error Resume Next
     Application.DisplayStatusBar = True
-    Application.StatusBar = vbNullString
     Application.StatusBar = False
     On Error GoTo 0
 End Sub
@@ -156,19 +206,6 @@ Private Function ReadySheetMap() As clsSheetMap
     Dim map As clsSheetMap
     Set map = New clsSheetMap
     map.Init ActiveWorkbook
-    ' Do NOT call EnsureLayoutLabels here — it was overwriting the user's Ingestion UI.
     map.EnsureModernSheetNames
     Set ReadySheetMap = map
 End Function
-
-Private Sub RunRefreshIngestedList()
-    Dim map As clsSheetMap
-    Dim appState As clsExcelAppState
-    Dim indexer As clsFileIndexer
-
-    Set map = ReadySheetMap()
-    Set appState = New clsExcelAppState
-    Set indexer = New clsFileIndexer
-    indexer.Init map, appState
-    indexer.RefreshIngestedListFromDatabase
-End Sub

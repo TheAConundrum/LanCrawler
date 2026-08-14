@@ -139,7 +139,7 @@ Fail:
 End Sub
 
 Private Sub SearchIndex(ByVal hits As Object, ByRef anyCriteria As Boolean)
-    Dim row As Long
+    Dim fileTerm As String
     Dim term1 As String
     Dim term2 As String
     Dim op As String
@@ -155,6 +155,7 @@ Private Sub SearchIndex(ByVal hits As Object, ByRef anyCriteria As Boolean)
     Dim cn As Object
     Dim tScan As Double
     Dim fileHitsBefore As Long
+    Dim extraAnd As String
 
     flexible = mMap.FlexibleMatch
     foldersMode = mMap.SearchFoldersMode
@@ -163,49 +164,60 @@ Private Sub SearchIndex(ByVal hits As Object, ByRef anyCriteria As Boolean)
     shareFilter = modIndexCache.ResolveDriveShareFilter(mMap.DriveFilterLabel)
     backend = modIndexCache.CurrentBackend
 
+    fileTerm = mMap.FileSearchTerm
+    term1 = mMap.CriteriaTerm1
+    op = mMap.CriteriaOp
+    term2 = mMap.CriteriaTerm2
+    sizeOp = mMap.CriteriaSizeOp
+    hasSizeFilter = ParseSizeFilter(sizeOp, mMap.CriteriaSizeMbValue, sizeMb)
+    extraAnd = vbNullString
+
+    ' File Search (A5) is the main box. Contains row is optional advanced filter.
+    If Len(fileTerm) > 0 And Len(term1) > 0 Then
+        extraAnd = fileTerm
+        ' term1/op/term2 stay as criteria Contains clause
+    ElseIf Len(fileTerm) > 0 Then
+        term1 = fileTerm
+        op = vbNullString
+        term2 = vbNullString
+    End If
+
     Debug.Print "SEARCH: backend=" & backend & " foldersMode=" & foldersMode & _
                 " flexible=" & CStr(flexible) & " drive=" & mMap.DriveFilterLabel & _
-                " shareFilter=" & shareFilter & " n=" & CStr(modIndexCache.IndexRowCount)
+                " shareFilter=" & shareFilter & " n=" & CStr(modIndexCache.IndexRowCount) & _
+                " term1=" & term1 & " extraAnd=" & extraAnd
+
+    If Len(term1) = 0 Then
+        anyCriteria = False
+        Exit Sub
+    End If
+    If op = "NOT" And Len(term2) = 0 Then
+        Err.Raise vbObjectError + 1, , "NOT requires a second Contains keyword."
+    End If
+    If Len(sizeOp) > 0 And Not hasSizeFilter Then
+        Err.Raise vbObjectError + 2, , "Size filter incomplete (pick < or > and enter MB)."
+    End If
+
+    anyCriteria = True
 
     If backend = modIndexCache.BACKEND_ACCDB Then
         Set cn = modIndexCache.OpenIndexConnection(ActiveWorkbook)
     End If
 
-    For row = mMap.CriteriaFirstRow To mMap.CriteriaLastRow
-        term1 = Trim$(CStr(mMap.Dashboard.Cells(row, mMap.CriteriaColTerm1).Value & ""))
-        If Len(term1) = 0 Then Exit For
-        anyCriteria = True
+    fileHitsBefore = hits.Count
+    tScan = Timer
 
-        op = UCase$(Trim$(CStr(mMap.Dashboard.Cells(row, mMap.CriteriaColOp).Value & "")))
-        term2 = Trim$(CStr(mMap.Dashboard.Cells(row, mMap.CriteriaColTerm2).Value & ""))
-        sizeOp = Trim$(CStr(mMap.Dashboard.Cells(row, mMap.CriteriaColSizeOp).Value & ""))
-        hasSizeFilter = ParseSizeFilter( _
-            sizeOp, _
-            mMap.Dashboard.Cells(row, mMap.CriteriaColSizeMb).Value, _
-            sizeMb)
+    If backend = modIndexCache.BACKEND_ACCDB Then
+        SearchAccdbCriteria cn, hits, term1, op, term2, flexible, _
+            includeFiles, includeFolders, hasSizeFilter, sizeOp, sizeMb, shareFilter, extraAnd
+    Else
+        modIndexCache.CollectPathHits term1, op, term2, flexible, _
+            includeFiles, includeFolders, hasSizeFilter, sizeOp, sizeMb, _
+            hits, shareFilter, extraAnd
+    End If
 
-        If op = "NOT" And Len(term2) = 0 Then
-            Err.Raise vbObjectError + 1, , "NOT requires a second Key Word (row " & CStr(row) & ")."
-        End If
-        If Len(sizeOp) > 0 And Not hasSizeFilter Then
-            Err.Raise vbObjectError + 2, , "Size filter incomplete (row " & CStr(row) & ")."
-        End If
-
-        fileHitsBefore = hits.Count
-        tScan = Timer
-
-        If backend = modIndexCache.BACKEND_ACCDB Then
-            SearchAccdbCriteria cn, hits, term1, op, term2, flexible, _
-                includeFiles, includeFolders, hasSizeFilter, sizeOp, sizeMb, shareFilter
-        Else
-            modIndexCache.CollectPathHits term1, op, term2, flexible, _
-                includeFiles, includeFolders, hasSizeFilter, sizeOp, sizeMb, _
-                hits, shareFilter
-        End If
-
-        Debug.Print "SEARCH: criteria row " & CStr(row) & " scan=" & FormatSeconds(ElapsedSeconds(tScan)) & _
-                    " term1=" & term1 & " hits+" & CStr(hits.Count - fileHitsBefore)
-    Next row
+    Debug.Print "SEARCH: scan=" & FormatSeconds(ElapsedSeconds(tScan)) & _
+                " hits+" & CStr(hits.Count - fileHitsBefore)
 
     If Not cn Is Nothing Then
         On Error Resume Next
@@ -219,7 +231,8 @@ Private Sub SearchAccdbCriteria(ByVal cn As Object, ByVal hits As Object, _
                                 ByVal flexible As Boolean, _
                                 ByVal includeFiles As Boolean, ByVal includeFolders As Boolean, _
                                 ByVal hasSizeFilter As Boolean, ByVal sizeOp As String, ByVal sizeMb As Double, _
-                                ByVal shareFilter As String)
+                                ByVal shareFilter As String, _
+                                Optional ByVal extraAndTerm As String = "")
     Dim rs As Object
     Dim sql As String
     Dim whereSql As String
@@ -230,18 +243,25 @@ Private Sub SearchAccdbCriteria(ByVal cn As Object, ByVal hits As Object, _
     Dim dt As Variant
     Dim t1 As String
     Dim t2 As String
+    Dim extraN As String
 
     t1 = term1
     t2 = term2
+    extraN = Trim$(extraAndTerm)
     If flexible Then
         t1 = modPathUtil.NormalizeForMatch(term1)
         If Len(Trim$(term2)) > 0 Then t2 = modPathUtil.NormalizeForMatch(term2)
+        If Len(extraN) > 0 Then extraN = modPathUtil.NormalizeForMatch(extraN)
         If Len(t1) = 0 Then Exit Sub
     End If
 
     whereSql = BuildAccdbWhere(t1, op, t2, includeFiles, includeFolders, _
-                               hasSizeFilter, sizeOp, sizeMb, shareFilter)
-    sql = "SELECT FilePath, FileDate, SizeMB, EntryType FROM tblFiles WHERE " & whereSql
+                               hasSizeFilter, sizeOp, sizeMb, shareFilter, extraN)
+    If Len(Trim$(whereSql)) = 0 Or whereSql = "()" Then
+        Err.Raise vbObjectError + 3, , "AccDB search produced an empty WHERE clause."
+    End If
+    sql = "SELECT [FilePath], [FileDate], [SizeMB], [EntryType] FROM [tblFiles] WHERE " & whereSql
+    Debug.Print "SEARCH: AccDB SQL=" & Left$(sql, 500)
 
     Set rs = CreateObject("ADODB.Recordset")
     rs.CursorLocation = 3 ' adUseClient
@@ -252,13 +272,22 @@ Private Sub SearchAccdbCriteria(ByVal cn As Object, ByVal hits As Object, _
         If Right$(path, 1) = "\" Then path = Left$(path, Len(path) - 1)
         If Len(path) > 0 Then
             If flexible Then
-                ' SQL matched raw FilePath; re-check normalized path for flexible mode
                 If Not FlexiblePathMatches(path, t1, op, t2) Then GoTo NextRec
+                If Len(extraN) > 0 Then
+                    If InStr(1, modPathUtil.NormalizeForMatch(path), extraN, vbBinaryCompare) = 0 Then GoTo NextRec
+                End If
             End If
             et = UCase$(Trim$(CStr(rs.Fields("EntryType").Value & "")))
             If Len(et) = 0 Then et = "FILE"
             isFolder = (et = "FOLDER")
             sizeVal = modPathUtil.CoerceStoredSizeMb(rs.Fields("SizeMB").Value)
+            If hasSizeFilter Then
+                If sizeOp = ">" Then
+                    If Not (sizeVal > sizeMb) Then GoTo NextRec
+                ElseIf sizeOp = "<" Then
+                    If Not (sizeVal < sizeMb) Then GoTo NextRec
+                End If
+            End If
             dt = rs.Fields("FileDate").Value
             If Not hits.Exists(path) Then
                 hits.Add path, Array(dt, sizeVal, isFolder, 0&, 0&)
@@ -296,31 +325,43 @@ End Function
 Private Function BuildAccdbWhere(ByVal term1 As String, ByVal op As String, ByVal term2 As String, _
                                  ByVal includeFiles As Boolean, ByVal includeFolders As Boolean, _
                                  ByVal hasSizeFilter As Boolean, ByVal sizeOp As String, ByVal sizeMb As Double, _
-                                 ByVal shareFilter As String) As String
+                                 ByVal shareFilter As String, _
+                                 Optional ByVal extraAndTerm As String = "") As String
     Dim parts As String
     Dim kw As String
-    Dim et As String
+    Dim shareEsc As String
+    Dim extra As String
 
     kw = KeywordClause(term1, op, term2)
+    If Len(Trim$(kw)) = 0 Then
+        BuildAccdbWhere = vbNullString
+        Exit Function
+    End If
     parts = "(" & kw & ")"
 
+    extra = Trim$(extraAndTerm)
+    If Len(extra) > 0 Then
+        parts = parts & " AND (" & PathContainsClause(extra) & ")"
+    End If
+
     If includeFiles And Not includeFolders Then
-        et = "(EntryType='FILE' OR EntryType IS NULL OR EntryType='')"
-        parts = parts & " AND " & et
+        parts = parts & " AND (UCase([EntryType])='FILE' OR [EntryType] IS NULL OR Len([EntryType] & '')=0)"
     ElseIf includeFolders And Not includeFiles Then
-        parts = parts & " AND EntryType='FOLDER'"
+        parts = parts & " AND UCase([EntryType])='FOLDER'"
     End If
 
     If hasSizeFilter Then
+        ' Loose SQL prefilter (raw column). Authoritative match is CoerceStoredSizeMb post-filter.
         If sizeOp = ">" Then
-            parts = parts & " AND SizeMB>" & Replace(CStr(sizeMb), ",", ".")
+            parts = parts & " AND [SizeMB]>" & Replace(CStr(sizeMb), ",", ".")
         ElseIf sizeOp = "<" Then
-            parts = parts & " AND SizeMB<" & Replace(CStr(sizeMb), ",", ".")
+            parts = parts & " AND [SizeMB]<" & Replace(CStr(sizeMb), ",", ".")
         End If
     End If
 
     If Len(Trim$(shareFilter)) > 0 Then
-        parts = parts & " AND FilePath LIKE '" & EscapeAccessLike(shareFilter & "\") & "%'"
+        shareEsc = EscapeAccessString(shareFilter)
+        parts = parts & " AND InStr(1, [FilePath], '" & shareEsc & "')=1"
     End If
 
     BuildAccdbWhere = parts
@@ -331,38 +372,48 @@ Private Function KeywordClause(ByVal term1 As String, ByVal op As String, ByVal 
     Dim c2 As String
     Dim hasTerm2 As Boolean
 
-    ' ACE OLEDB LIKE uses ANSI wildcards % and _
-    c1 = "FilePath LIKE '%" & EscapeAccessLike(term1) & "%'"
+    ' InStr is reliable via ACE/ADODB; LIKE %/* wildcard mode varies by ANSI setting.
+    c1 = PathContainsClause(term1)
+    If Len(c1) = 0 Then
+        KeywordClause = vbNullString
+        Exit Function
+    End If
     hasTerm2 = (Len(Trim$(term2)) > 0 And Len(Trim$(op)) > 0)
     If Not hasTerm2 Then
         KeywordClause = c1
         Exit Function
     End If
-    c2 = "FilePath LIKE '%" & EscapeAccessLike(term2) & "%'"
+    c2 = PathContainsClause(term2)
+    If Len(c2) = 0 Then
+        KeywordClause = c1
+        Exit Function
+    End If
     Select Case UCase$(Trim$(op))
         Case "AND"
             KeywordClause = "(" & c1 & " AND " & c2 & ")"
         Case "OR"
             KeywordClause = "(" & c1 & " OR " & c2 & ")"
         Case "NOT"
-            KeywordClause = "(" & c1 & " AND NOT " & c2 & ")"
+            KeywordClause = "(" & c1 & " AND NOT (" & c2 & "))"
         Case Else
             KeywordClause = c1
     End Select
 End Function
 
-Private Function EscapeAccessLike(ByVal text As String) As String
-    Dim s As String
-    s = Replace(text, "'", "''")
-    s = Replace(s, "[", "[[]")
-    s = Replace(s, "%", "[%]")
-    s = Replace(s, "_", "[_]")
-    s = Replace(s, "*", "[*]")
-    s = Replace(s, "?", "[?]")
-    s = Replace(s, "#", "[#]")
-    EscapeAccessLike = s
+Private Function PathContainsClause(ByVal term As String) As String
+    Dim t As String
+    t = Trim$(term)
+    If Len(t) = 0 Then
+        PathContainsClause = vbNullString
+        Exit Function
+    End If
+    ' Case-insensitive path substring match
+    PathContainsClause = "InStr(1, LCase([FilePath]), LCase('" & EscapeAccessString(t) & "'))>0"
 End Function
 
+Private Function EscapeAccessString(ByVal text As String) As String
+    EscapeAccessString = Replace(text, "'", "''")
+End Function
 Private Function ParseSizeFilter(ByRef sizeOp As String, ByVal sizeValue As Variant, ByRef sizeMb As Double) As Boolean
     Dim opNorm As String
     Dim raw As String
@@ -395,36 +446,18 @@ End Function
 Private Sub ClearResults()
     Dim ws As Worksheet
     Dim tbl As ListObject
-    Dim firstDataRow As Long
-    Dim lastCol As Long
-    Dim linkCol As Long
-    Dim clearTo As Long
-    Dim maxRows As Long
 
     Set ws = mMap.Dashboard
-    firstDataRow = mMap.ResultsFirstDataRow
-    lastCol = mMap.ResultsLastCol
-    linkCol = mMap.ResultsLinkCol
-    maxRows = mMap.ResultsMaxRows
-    If firstDataRow <= mMap.ResultsHeaderRow Then firstDataRow = mMap.ResultsHeaderRow + 1
 
     mMap.UnprotectDashboard
+    mMap.ClearResultsAutoFilter
 
     On Error Resume Next
     Set tbl = ws.ListObjects(mMap.TableResultsName)
     If Not tbl Is Nothing Then tbl.Delete
     On Error GoTo 0
 
-    clearTo = firstDataRow + maxRows - 1
-
-    With ws.Range(ws.Cells(firstDataRow, 1), ws.Cells(clearTo, lastCol))
-        .ClearContents
-        On Error Resume Next
-        .Hyperlinks.Delete
-        .ClearHyperlinks
-        On Error GoTo 0
-    End With
-    ws.Range(ws.Cells(firstDataRow, linkCol), ws.Cells(clearTo, linkCol)).ClearContents
+    mMap.ClearResultsValues
 
     mMap.EnsureDashboardChromeMerges
 End Sub
@@ -512,7 +545,12 @@ Private Sub WriteResults(ByVal hits As Object)
     ReDim sorted(1 To n)
     ReDim sortKey(1 To n)
     If n = 1 Then
-        sorted(1) = CStr(keys)
+        ' Scripting.Dictionary.Keys is a scalar for 1 item on some hosts, an array on others
+        If IsArray(keys) Then
+            sorted(1) = CStr(keys(LBound(keys)))
+        Else
+            sorted(1) = CStr(keys)
+        End If
         sortKey(1) = ResultSortKey(sorted(1), hits(sorted(1)))
     Else
         For i = 0 To n - 1
@@ -592,19 +630,20 @@ Private Sub WriteResults(ByVal hits As Object)
                 End If
             End If
             If IsArray(meta) Then
-                totalSizeMb = totalSizeMb + CDbl(modPathUtil.CoerceStoredSizeMb(meta(1)) & 0)
+                totalSizeMb = totalSizeMb + CDbl(modPathUtil.CoerceStoredSizeMb(meta(1)))
             Else
                 totalSizeMb = totalSizeMb + 0.01
             End If
         End If
 
         If i <= writeN Then
-            groupDrive = modIndexCache.FriendlyLabelForShare(groupFolderUnc)
-            groupFolderDisplay = modPathUtil.ToDisplayPath(groupFolderUnc)
             If StrComp(groupFolderUnc, prevFolderKey, vbTextCompare) = 0 Then
                 outDrive(i, 1) = Empty
                 outFolder(i, 1) = Empty
             Else
+                ' Resolve drive label only when the folder group changes (was per-row Shell/WNet)
+                groupDrive = modIndexCache.FriendlyLabelForShare(groupFolderUnc)
+                groupFolderDisplay = modPathUtil.ToDisplayPath(groupFolderUnc)
                 outDrive(i, 1) = groupDrive
                 outFolder(i, 1) = groupFolderDisplay
                 prevFolderKey = groupFolderUnc
@@ -631,10 +670,7 @@ Private Sub WriteResults(ByVal hits As Object)
     sizeRng.NumberFormat = "0.00"
     sizeRng.HorizontalAlignment = xlRight
     ws.Range(ws.Cells(firstDataRow, typeCol), ws.Cells(firstDataRow + writeN - 1, typeCol)).HorizontalAlignment = xlCenter
-    With fileRng.Font
-        .Color = RGB(5, 99, 193)
-        .Underline = xlUnderlineStyleSingle
-    End With
+    ' Do not set File Font/Alignment on A8:An as a block — collapses per-row A:K merges into A8:An
     ' Folder Path / Drive Address: plain text only (blank repeats are intentional grouping)
     With ws.Range(ws.Cells(firstDataRow, driveCol), ws.Cells(firstDataRow + writeN - 1, folderCol))
         .Font.ColorIndex = xlColorIndexAutomatic

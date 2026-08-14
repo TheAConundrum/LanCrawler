@@ -25,7 +25,7 @@ A small GUI asks for:
 3. Index target: **Auto** | **Workbook** | **AccDB**
 
 **Auto / Workbook** under **750,000** rows → import into `Database!tblFiles`.  
-**AccDB**, or any mode above **750,000** rows → write `{workbook}\DB\LAN_Search_Index.accdb`, clear onboard `tblFiles`, and inform you. CSV still goes to `crawl_output\`.
+**AccDB**, or any mode above **750,000** rows → write `{workbook}\DB\LAN_Search_Index.accdb` (`tblFiles` + `tblIngested`). Each AccDB crawl **ReplaceRoot**-merges that folder into the AccDB (keeps other roots’ files and scan history). On workbook open / cache warm (and when AccDB is deleted), VBA restores **Ingestion!tblIngested** from AccDB only — or clears it if the AccDB file is gone. CSV still goes to `crawl_output\`.
 
 Keep `Blank_LAN_Crawler Tool.xlsm` as the stable non-AccDB template; AccDB development uses `AccDB-Blank_LAN_Crawler Tool.xlsm`.
 

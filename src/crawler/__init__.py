@@ -6,8 +6,10 @@ from .crawl import (
     ACCDB_ROW_THRESHOLD,
     CrawlStats,
     IndexRow,
+    IngestLogRow,
     accdb_path_for_workbook,
     crawl_parallel,
+    ingest_stats_from_rows,
     write_accdb,
     write_csv,
 )
@@ -18,8 +20,10 @@ __all__ = [
     "ACCDB_ROW_THRESHOLD",
     "CrawlStats",
     "IndexRow",
+    "IngestLogRow",
     "accdb_path_for_workbook",
     "crawl_parallel",
+    "ingest_stats_from_rows",
     "write_accdb",
     "write_csv",
 ]

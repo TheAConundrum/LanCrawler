@@ -3,8 +3,8 @@ Option Explicit
 Option Private Module
 
 ' Exclusive session index backend:
-'   Sheet  — onboard Database!tblFiles is non-empty (used for the whole session)
-'   AccDB  — sheet empty and {workbook}\DB\LAN_Search_Index.accdb exists
+'   AccDB  — {workbook}\DB\LAN_Search_Index.accdb exists (preferred when present)
+'   Sheet  — no AccDB and onboard Database!tblFiles is non-empty
 '   Empty  — neither available
 ' No hybrid merge. Resolve once on warm / EnsureResolved.
 
@@ -51,14 +51,6 @@ End Function
 
 Public Function LastGetWasCacheHit() As Boolean
     LastGetWasCacheHit = mLastGetWasHit
-End Function
-
-Public Function LastGetSeconds() As Double
-    LastGetSeconds = mLastGetSeconds
-End Function
-
-Public Function LastLoadSeconds() As Double
-    LastLoadSeconds = mLastLoadSeconds
 End Function
 
 Public Function AccdbPath(Optional ByVal wb As Workbook = Nothing) As String
@@ -144,6 +136,7 @@ Public Function SheetTblFilesNonEmpty(Optional ByVal wb As Workbook = Nothing) A
 End Function
 
 ' Resolve exclusive backend once per session (or after Invalidate / SetIndexData).
+' Re-checks AccDB file presence so deleting DB\*.accdb clears Ingestion on next warm/search.
 Public Sub ResolveIndexBackend(Optional ByVal wb As Workbook = Nothing)
     Dim t0 As Double
     t0 = Timer
@@ -158,33 +151,27 @@ Public Sub ResolveIndexBackend(Optional ByVal wb As Workbook = Nothing)
 
     If mResolved And Len(mWorkbookPath) > 0 Then
         If StrComp(mWorkbookPath, wb.FullName, vbTextCompare) = 0 Then
-            mLastGetSeconds = ElapsedSeconds(t0)
-            RefreshDashboardDriveList wb
-            Exit Sub
+            If BackendStillValid(wb) Then
+                mLastGetSeconds = ElapsedSeconds(t0)
+                RefreshDashboardDriveList wb
+                Exit Sub
+            End If
+            Debug.Print "INDEX: backend stale (AccDB added/removed) — re-resolving"
+            InvalidateIndex
         End If
     End If
 
     InvalidateIndex
     mWorkbookPath = wb.FullName
 
-    If SheetTblFilesNonEmpty(wb) Then
-        mBackend = BACKEND_SHEET
-        LoadSheetSlim wb
-        BuildDriveMapsFromSheet
-        mResolved = True
-        mLastLoadSeconds = ElapsedSeconds(t0)
-        Debug.Print "INDEX: ResolveIndexBackend=Sheet rows=" & CStr(mRowCount) & _
-                    " " & FormatSeconds(mLastLoadSeconds)
-        RefreshDashboardDriveList wb
-        Exit Sub
-    End If
-
+    ' AccDB wins when present (sheet leftovers must not shadow AccDB-Blank crawls)
     If AccdbExists(wb) Then
         mBackend = BACKEND_ACCDB
         mRowCount = AccdbRowCount(wb)
         mSheetLoaded = False
         mData = Empty
         BuildDriveMapsFromAccdb wb
+        SyncIngestionFromAccdb wb
         mResolved = True
         mLastLoadSeconds = ElapsedSeconds(t0)
         Debug.Print "INDEX: ResolveIndexBackend=AccDB rows=" & CStr(mRowCount) & _
@@ -193,19 +180,58 @@ Public Sub ResolveIndexBackend(Optional ByVal wb As Workbook = Nothing)
         Exit Sub
     End If
 
+    If SheetTblFilesNonEmpty(wb) Then
+        mBackend = BACKEND_SHEET
+        LoadSheetSlim wb
+        BuildDriveMapsFromSheet
+        PurgeSyntheticIngestRows wb
+        mResolved = True
+        mLastLoadSeconds = ElapsedSeconds(t0)
+        Debug.Print "INDEX: ResolveIndexBackend=Sheet rows=" & CStr(mRowCount) & _
+                    " " & FormatSeconds(mLastLoadSeconds)
+        RefreshDashboardDriveList wb
+        Exit Sub
+    End If
+
     mBackend = BACKEND_EMPTY
     mResolved = True
     mRowCount = 0
+    ClearIngestionWhenNoAccdb wb
     mLastLoadSeconds = ElapsedSeconds(t0)
     Debug.Print "INDEX: ResolveIndexBackend=Empty " & FormatSeconds(mLastLoadSeconds)
     RefreshDashboardDriveList wb
 End Sub
 
+Private Function BackendStillValid(ByVal wb As Workbook) As Boolean
+    If Not mResolved Then
+        BackendStillValid = False
+        Exit Function
+    End If
+    If Len(mWorkbookPath) = 0 Or StrComp(mWorkbookPath, wb.FullName, vbTextCompare) <> 0 Then
+        BackendStillValid = False
+        Exit Function
+    End If
+
+    Select Case mBackend
+        Case BACKEND_ACCDB
+            ' AccDB deleted from DB\ → invalid (must clear Ingestion / fall back)
+            BackendStillValid = AccdbExists(wb)
+        Case BACKEND_SHEET
+            ' AccDB appeared → prefer AccDB; sheet emptied → re-resolve
+            BackendStillValid = (Not AccdbExists(wb)) And SheetTblFilesNonEmpty(wb)
+        Case BACKEND_EMPTY
+            BackendStillValid = (Not AccdbExists(wb)) And (Not SheetTblFilesNonEmpty(wb))
+        Case Else
+            BackendStillValid = True
+    End Select
+End Function
+
 Public Sub EnsureLoaded(Optional ByVal wb As Workbook = Nothing)
     Dim t0 As Double
     t0 = Timer
-    mLastGetWasHit = mResolved And (mBackend <> BACKEND_EMPTY)
-    If Not mResolved Then
+    If wb Is Nothing Then Set wb = ActiveWorkbook
+    mLastGetWasHit = mResolved And (mBackend <> BACKEND_EMPTY) And BackendStillValid(wb)
+    If (Not mResolved) Or (Not BackendStillValid(wb)) Then
         ResolveIndexBackend wb
     Else
         RefreshDashboardDriveList wb
@@ -214,11 +240,16 @@ Public Sub EnsureLoaded(Optional ByVal wb As Workbook = Nothing)
 End Sub
 
 Public Sub WarmIndexIfNeeded(Optional ByVal wb As Workbook = Nothing)
-    If mResolved Then
+    If wb Is Nothing Then Set wb = ActiveWorkbook
+    If mResolved And BackendStillValid(wb) Then
         Debug.Print "INDEX: already resolved backend=" & mBackend & " rows=" & CStr(mRowCount)
         Exit Sub
     End If
-    Debug.Print "INDEX: WarmIndexIfNeeded resolving backend..."
+    If mResolved Then
+        Debug.Print "INDEX: WarmIndexIfNeeded backend stale — re-resolving..."
+    Else
+        Debug.Print "INDEX: WarmIndexIfNeeded resolving backend..."
+    End If
     ResolveIndexBackend wb
 End Sub
 
@@ -263,7 +294,8 @@ Public Sub CollectPathHits(ByVal term1 As String, ByVal op As String, ByVal term
                            ByVal includeFiles As Boolean, ByVal includeFolders As Boolean, _
                            ByVal hasSizeFilter As Boolean, ByVal sizeOp As String, ByVal sizeMb As Double, _
                            ByVal hits As Object, _
-                           Optional ByVal shareFilter As String = "")
+                           Optional ByVal shareFilter As String = "", _
+                           Optional ByVal extraAndTerm As String = "")
     Dim i As Long
     Dim path As String
     Dim et As String
@@ -272,6 +304,7 @@ Public Sub CollectPathHits(ByVal term1 As String, ByVal op As String, ByVal term
     Dim dt As Variant
     Dim term1N As String
     Dim term2N As String
+    Dim extraN As String
     Dim hay As String
     Dim hasTerm2 As Boolean
     Dim has1 As Boolean
@@ -287,10 +320,12 @@ Public Sub CollectPathHits(ByVal term1 As String, ByVal op As String, ByVal term
     op = UCase$(Trim$(op))
     hasTerm2 = (Len(term2) > 0 And Len(op) > 0)
     filterShare = Trim$(shareFilter)
+    extraN = Trim$(extraAndTerm)
 
     If flexible Then
         term1N = modPathUtil.NormalizeForMatch(term1)
         If hasTerm2 Then term2N = modPathUtil.NormalizeForMatch(term2)
+        If Len(extraN) > 0 Then extraN = modPathUtil.NormalizeForMatch(extraN)
         If Len(term1N) = 0 Then Exit Sub
     End If
 
@@ -322,6 +357,9 @@ Public Sub CollectPathHits(ByVal term1 As String, ByVal op As String, ByVal term
             Else
                 matched = has1
             End If
+            If matched And Len(extraN) > 0 Then
+                matched = (InStr(1, hay, extraN, vbBinaryCompare) > 0)
+            End If
         Else
             hay = path
             has1 = (InStr(1, hay, term1, vbTextCompare) > 0)
@@ -330,6 +368,9 @@ Public Sub CollectPathHits(ByVal term1 As String, ByVal op As String, ByVal term
                 matched = CombineMatch(has1, has2, op)
             Else
                 matched = has1
+            End If
+            If matched And Len(extraAndTerm) > 0 Then
+                matched = (InStr(1, hay, Trim$(extraAndTerm), vbTextCompare) > 0)
             End If
         End If
         If Not matched Then GoTo NextRow
@@ -365,35 +406,80 @@ Public Function ResolveDriveShareFilter(ByVal label As String) As String
     End If
 End Function
 
+' Drive column label for results. Must not call WNet/Shell on the search hot path —
+' UncShareRoot → ToUncPath / FriendlyDriveLabel can hang ~10s+ per miss on local or dead mappings.
 Public Function FriendlyLabelForShare(ByVal shareOrPath As String) As String
     Dim share As String
     Dim label As String
+    Dim unique As String
+    Dim suffix As Long
+    Dim p As String
+    Dim slashPos As Long
+    Dim second As Long
 
-    share = Trim$(shareOrPath)
-    If Len(share) = 0 Then
-        FriendlyLabelForShare = vbNullString
-        Exit Function
-    End If
-    If Left$(share, 2) = "\\" Or (Len(share) >= 2 And Mid$(share, 2, 1) = ":") Then
-        share = modPathUtil.UncShareRoot(share)
-    End If
-    If Len(share) = 0 Then
+    p = Trim$(Replace(shareOrPath, "/", "\"))
+    If Len(p) = 0 Then
         FriendlyLabelForShare = vbNullString
         Exit Function
     End If
 
-    If Not mLabelByShare Is Nothing Then
-        If mLabelByShare.Exists(share) Then
-            FriendlyLabelForShare = CStr(mLabelByShare(share))
-            Exit Function
+    ' Resolve share root without ToUncPath / WNetGetConnection
+    If Left$(p, 2) = "\\" Then
+        slashPos = InStr(3, p, "\")
+        If slashPos <= 0 Then
+            share = p
+        Else
+            second = InStr(slashPos + 1, p, "\")
+            If second > 0 Then
+                share = Left$(p, second - 1)
+            Else
+                share = p
+            End If
         End If
+    ElseIf Len(p) >= 2 And Mid$(p, 2, 1) = ":" Then
+        share = UCase$(Left$(p, 2))
+    Else
+        share = p
+    End If
+    If Len(share) = 0 Then
+        FriendlyLabelForShare = vbNullString
+        Exit Function
     End If
 
-    label = modPathUtil.FriendlyDriveLabel(share)
-    If Len(label) = 0 Then label = share
-    FriendlyLabelForShare = label
-End Function
+    If mLabelByShare Is Nothing Then
+        Set mLabelByShare = CreateObject("Scripting.Dictionary")
+        mLabelByShare.CompareMode = 1
+    End If
+    If mDriveByLabel Is Nothing Then
+        Set mDriveByLabel = CreateObject("Scripting.Dictionary")
+        mDriveByLabel.CompareMode = 1
+    End If
 
+    If mLabelByShare.Exists(share) Then
+        FriendlyLabelForShare = CStr(mLabelByShare(share))
+        Exit Function
+    End If
+
+    ' Local letter: never Shell/WNet. UNC miss: resolve once, then cache.
+    If Len(share) = 2 And Mid$(share, 2, 1) = ":" Then
+        label = share
+    Else
+        label = modPathUtil.FriendlyDriveLabel(share)
+        If Len(label) = 0 Then label = share
+    End If
+
+    unique = label
+    suffix = 2
+    Do While mDriveByLabel.Exists(unique)
+        If StrComp(CStr(mDriveByLabel(unique)), share, vbTextCompare) = 0 Then Exit Do
+        unique = label & " (" & CStr(suffix) & ")"
+        suffix = suffix + 1
+    Loop
+    If Not mDriveByLabel.Exists(unique) Then mDriveByLabel.Add unique, share
+    If Not mLabelByShare.Exists(share) Then mLabelByShare.Add share, unique
+
+    FriendlyLabelForShare = unique
+End Function
 Public Sub RefreshDashboardDriveList(Optional ByVal wb As Workbook = Nothing)
     Dim map As clsSheetMap
     Dim ws As Worksheet
@@ -534,13 +620,138 @@ Private Function AccdbRowCount(ByVal wb As Workbook) As Long
     Set cn = OpenIndexConnection(wb)
     Set rs = CreateObject("ADODB.Recordset")
     rs.Open "SELECT COUNT(*) AS Cnt FROM tblFiles", cn
-    If Not rs.EOF Then AccdbRowCount = CLng(rs.Fields(0).Value & 0)
+    If Not rs.EOF Then AccdbRowCount = CLng(Val(CStr(rs.Fields(0).Value & "")))
     rs.Close
     cn.Close
     Exit Function
 Fail:
     AccdbRowCount = 0
 End Function
+
+' Restore Ingestion!tblIngested + E2:E5 from AccDB tblIngested only (scan roots in the DB).
+Private Sub SyncIngestionFromAccdb(ByVal wb As Workbook)
+    Dim cn As Object
+    Dim rs As Object
+    Dim map As clsSheetMap
+    Dim appState As clsExcelAppState
+    Dim indexer As clsFileIndexer
+    Dim logRows() As Variant
+    Dim bag As Collection
+    Dim item As Variant
+    Dim i As Long
+    Dim n As Long
+    Dim root As String
+    Dim whenTxt As String
+    Dim files As Long
+    Dim folders As Long
+    Dim sizeMb As Double
+    Dim t0 As Double
+    Dim hasTable As Boolean
+
+    t0 = Timer
+    On Error GoTo Fail
+    Set cn = OpenIndexConnection(wb)
+    Set rs = CreateObject("ADODB.Recordset")
+    Set bag = New Collection
+
+    hasTable = False
+    On Error Resume Next
+    rs.Open "SELECT [RootPath], [DateIngested], [FileCount], [FolderCount], [TotalSizeMB] " & _
+            "FROM [tblIngested] ORDER BY [RootPath]", cn
+    If Err.Number = 0 Then
+        hasTable = True
+    Else
+        Err.Clear
+    End If
+    On Error GoTo Fail
+
+    If hasTable Then
+        Do While Not rs.EOF
+            root = Trim$(CStr(rs.Fields(0).Value & ""))
+            ' Skip synthetic legacy label — only real crawl roots
+            If Len(root) > 0 And StrComp(root, "(AccDB index)", vbTextCompare) <> 0 Then
+                whenTxt = Trim$(CStr(rs.Fields(1).Value & ""))
+                files = CLng(Val(CStr(rs.Fields(2).Value & "")))
+                folders = CLng(Val(CStr(rs.Fields(3).Value & "")))
+                sizeMb = Round(Val(CStr(rs.Fields(4).Value & "")), 2)
+                bag.Add Array(root, whenTxt, files, folders, sizeMb)
+            End If
+            rs.MoveNext
+        Loop
+        rs.Close
+    End If
+    cn.Close
+
+    n = bag.Count
+    If n > 0 Then
+        ReDim logRows(1 To n, 1 To 5)
+        For i = 1 To n
+            item = bag(i)
+            logRows(i, 1) = item(0)
+            logRows(i, 2) = item(1)
+            logRows(i, 3) = item(2)
+            logRows(i, 4) = item(3)
+            logRows(i, 5) = item(4)
+        Next i
+    End If
+
+    Set map = New clsSheetMap
+    map.Init wb
+    Set appState = New clsExcelAppState
+    Set indexer = New clsFileIndexer
+    indexer.Init map, appState
+    ' Replace sheet history with AccDB scan list only (empty if tblIngested missing/empty)
+    indexer.ReplaceIngestedLog logRows, n
+    Debug.Print "INDEX: SyncIngestionFromAccdb scans=" & CStr(n) & " " & FormatSeconds(ElapsedSeconds(t0))
+    Exit Sub
+Fail:
+    On Error Resume Next
+    If Not rs Is Nothing Then
+        If rs.State <> 0 Then rs.Close
+    End If
+    If Not cn Is Nothing Then
+        If cn.State <> 0 Then cn.Close
+    End If
+    Debug.Print "INDEX: SyncIngestionFromAccdb failed " & Err.Description
+End Sub
+
+' AccDB was removed / never present and sheet index is empty — drop stale Links already Eaten.
+Private Sub ClearIngestionWhenNoAccdb(ByVal wb As Workbook)
+    Dim map As clsSheetMap
+    Dim appState As clsExcelAppState
+    Dim indexer As clsFileIndexer
+    Dim emptyRows() As Variant
+
+    On Error GoTo Fail
+    Set map = New clsSheetMap
+    map.Init wb
+    Set appState = New clsExcelAppState
+    Set indexer = New clsFileIndexer
+    indexer.Init map, appState
+    indexer.ReplaceIngestedLog emptyRows, 0
+    Debug.Print "INDEX: ClearIngestionWhenNoAccdb (no AccDB / empty backend)"
+    Exit Sub
+Fail:
+    Debug.Print "INDEX: ClearIngestionWhenNoAccdb failed " & Err.Description
+End Sub
+
+' Drop legacy synthetic "(AccDB index)" rows left on the sheet Ingestion log.
+Private Sub PurgeSyntheticIngestRows(ByVal wb As Workbook)
+    Dim map As clsSheetMap
+    Dim appState As clsExcelAppState
+    Dim indexer As clsFileIndexer
+
+    On Error GoTo Fail
+    Set map = New clsSheetMap
+    map.Init wb
+    Set appState = New clsExcelAppState
+    Set indexer = New clsFileIndexer
+    indexer.Init map, appState
+    indexer.RemoveSyntheticAccdbIngestRows
+    Exit Sub
+Fail:
+    Debug.Print "INDEX: PurgeSyntheticIngestRows failed " & Err.Description
+End Sub
 
 Private Sub BuildDriveMapsFromSheet()
     Dim i As Long
@@ -563,7 +774,8 @@ Private Sub BuildDriveMapsFromAccdb(ByVal wb As Workbook)
     On Error GoTo Fail
     Set cn = OpenIndexConnection(wb)
     Set rs = CreateObject("ADODB.Recordset")
-    ' Distinct \\server\share from UNC FilePath (3rd backslash ends the share)
+
+    ' Distinct \\server\share from UNC FilePath
     sql = "SELECT DISTINCT Left([FilePath], InStr(InStr(3,[FilePath],'\')+1,[FilePath],'\')-1) AS ShareRoot " & _
           "FROM tblFiles WHERE Left([FilePath],2)='\\' AND InStr(3,[FilePath],'\')>0 " & _
           "AND InStr(InStr(3,[FilePath],'\')+1,[FilePath],'\')>0"
@@ -574,10 +786,41 @@ Private Sub BuildDriveMapsFromAccdb(ByVal wb As Workbook)
         rs.MoveNext
     Loop
     rs.Close
+
+    ' Local drive roots (C:) — AccDB test crawls are often mapped-letter paths
+    sql = "SELECT DISTINCT UCase(Left([FilePath],2)) AS ShareRoot FROM tblFiles " & _
+          "WHERE Len([FilePath])>=2 AND Mid([FilePath],2,1)=':'"
+    rs.Open sql, cn
+    Do While Not rs.EOF
+        share = Trim$(CStr(rs.Fields(0).Value & ""))
+        If Len(share) = 2 Then AddLocalDriveShare share
+        rs.MoveNext
+    Loop
+    rs.Close
     cn.Close
     Exit Sub
 Fail:
     Debug.Print "INDEX: BuildDriveMapsFromAccdb failed " & Err.Description
+End Sub
+
+Private Sub AddLocalDriveShare(ByVal driveRoot As String)
+    Dim label As String
+    Dim unique As String
+    Dim suffix As Long
+
+    driveRoot = UCase$(Trim$(driveRoot))
+    If Len(driveRoot) <> 2 Or Mid$(driveRoot, 2, 1) <> ":" Then Exit Sub
+    If mLabelByShare.Exists(driveRoot) Then Exit Sub
+
+    label = driveRoot
+    unique = label
+    suffix = 2
+    Do While mDriveByLabel.Exists(unique)
+        unique = label & " (" & CStr(suffix) & ")"
+        suffix = suffix + 1
+    Loop
+    mDriveByLabel.Add unique, driveRoot
+    mLabelByShare.Add driveRoot, unique
 End Sub
 
 Private Sub InitDriveMaps()
@@ -592,11 +835,24 @@ Private Sub AddShareFromPath(ByVal path As String)
     Dim label As String
     Dim unique As String
     Dim suffix As Long
+    Dim p As String
 
     path = Trim$(path)
     If Len(path) = 0 Then Exit Sub
+
+    p = Replace(path, "/", "\")
+    ' Local drive letter — map as "C:" without WNet
+    If Len(p) >= 2 And Mid$(p, 2, 1) = ":" And Left$(p, 2) <> "\\" Then
+        AddLocalDriveShare UCase$(Left$(p, 2))
+        Exit Sub
+    End If
+
     share = modPathUtil.UncShareRoot(path)
     If Len(share) = 0 Then Exit Sub
+    If Len(share) = 2 And Mid$(share, 2, 1) = ":" Then
+        AddLocalDriveShare share
+        Exit Sub
+    End If
     If mLabelByShare.Exists(share) Then Exit Sub
 
     label = modPathUtil.FriendlyDriveLabel(share)

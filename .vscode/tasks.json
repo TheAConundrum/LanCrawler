@@ -43,6 +43,28 @@
             "detail": "Crawl GUI → folder + AccDB-Blank workbook + Auto/Workbook/AccDB → exclusive index write."
         },
         {
+            "label": "Unlock workbook for layout edit",
+            "type": "shell",
+            "command": "${command:python.interpreterPath}",
+            "args": [
+                "${workspaceFolder}\\src\\unlock_workbook.py",
+                "${workspaceFolder}\\AccDB-Blank_LAN_Crawler Tool.xlsm"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": [],
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": true,
+                "panel": "dedicated",
+                "showReuseMessage": false,
+                "clear": true
+            },
+            "detail": "Unprotect sheets, unlock cells, unhide Database; leave Excel open for Dashboard edits."
+        },
+        {
             "label": "1. Run Python Inject",
             "type": "shell",
             "command": "${command:python.interpreterPath}",

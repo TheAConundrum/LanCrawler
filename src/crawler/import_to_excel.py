@@ -8,6 +8,7 @@ from pathlib import Path
 
 from workbook_security import (
     enforce_workbook_ui_lock,
+    reopen_workbook_in_app,
 )
 
 from .paths import bytes_to_size_mb, path_starts_with_root, strip_trailing_slash
@@ -485,31 +486,10 @@ def import_csv_to_workbook(
         wb.save()
         print(f"Saved {wb.name} ({total:,} tblFiles rows).", flush=True)
 
-        # Close + reopen with events so Workbook_Open schedules cache warm
-        print("Reopening workbook (events on → cache warm)...", flush=True)
-        try:
-            wb.close()
-        except Exception:
-            pass
-        wb = None
-
-        try:
-            app.screen_updating = True
-            app.display_alerts = True
-            app.enable_events = True
-        except Exception:
-            try:
-                app.api.EnableEvents = True
-            except Exception:
-                pass
-
-        wb = app.books.open(saved_path)
-        try:
-            wb.activate()
-        except Exception:
-            pass
+        print("Reopening workbook so Workbook_Open / cache warm can run...", flush=True)
+        reopen_workbook_in_app(app, saved_path)
+        app = None  # leave Excel running — do not Quit (avoids Safe Mode prompt)
         print("Import complete. Excel left open.", flush=True)
-        app = None  # do not quit in finally
         return total
     finally:
         if app is not None:
@@ -521,20 +501,40 @@ def import_csv_to_workbook(
                 pass
             if we_started_app:
                 try:
-                    if len(app.books) == 0:
-                        app.quit()
-                except Exception:
-                    pass
-            else:
-                try:
-                    app.screen_updating = True
-                    app.display_alerts = True
-                    app.enable_events = True
+                    from workbook_security import soft_quit_excel_app
+
+                    soft_quit_excel_app(app)
                 except Exception:
                     try:
-                        app.api.EnableEvents = True
+                        app.quit()
                     except Exception:
                         pass
+            else:
+                try:
+                    from workbook_security import restore_excel_interactive
+
+                    restore_excel_interactive(app)
+                except Exception:
+                    pass
+
+
+def _clear_ingested_table_for_accdb(ws) -> None:
+    """Empty Links already Eaten — AccDB tblIngested will refill on cache warm."""
+    tbl = _ensure_ingested_table(ws, INGESTED_TABLE)
+    try:
+        while tbl.api.ListRows.Count > 0:
+            tbl.api.ListRows(1).Delete()
+    except Exception:
+        try:
+            body = tbl.data_body_range
+            if body is not None:
+                body.clear_contents()
+        except Exception:
+            pass
+    ws.range(SUMMARY_SCANS).value = 0
+    ws.range(SUMMARY_FILES).value = 0
+    ws.range(SUMMARY_FOLDERS).value = 0
+    ws.range(SUMMARY_SIZE).value = 0
 
 
 def clear_onboard_tblfiles(
@@ -545,6 +545,7 @@ def clear_onboard_tblfiles(
 ) -> None:
     """
     Empty Database!tblFiles so AccDB can be the exclusive session backend.
+    Also clears Ingestion!tblIngested (AccDB scan history reloads on warm).
     Required after AccDB writes so leftover sheet rows cannot shadow AccDB on load.
     """
     import xlwings as xw
@@ -558,12 +559,12 @@ def clear_onboard_tblfiles(
     app = host_app
     we_started_app = False
     if app is None:
-        app = xw.App(visible=True, add_book=False)
+        app = xw.App(visible=False, add_book=False)
         we_started_app = True
 
     wb = None
     try:
-        app.visible = True
+        app.visible = False
         app.screen_updating = False
         app.display_alerts = False
         try:
@@ -611,6 +612,21 @@ def clear_onboard_tblfiles(
             # If delete fails, clear the blank row contents
             ws.range((2, 1), (2, 4)).clear_contents()
 
+        # AccDB owns scan history — wipe sheet Ingestion so AccDB tblIngested is source of truth
+        try:
+            ws_ing = wb.sheets[INGESTION_SHEET]
+            try:
+                ws_ing.api.Unprotect(Password="")
+            except Exception:
+                try:
+                    ws_ing.api.Unprotect()
+                except Exception:
+                    pass
+            _clear_ingested_table_for_accdb(ws_ing)
+            print("Cleared Ingestion!tblIngested (will reload from AccDB on open).", flush=True)
+        except Exception as exc:
+            print(f"Ingestion clear skipped: {exc}", flush=True)
+
         try:
             wb.sheets["Dashboard"].api.Unprotect(Password="")
         except Exception:
@@ -623,29 +639,9 @@ def clear_onboard_tblfiles(
         wb.save()
         print(f"Cleared onboard {table_name} in {wb.name} (AccDB is exclusive index).", flush=True)
 
-        try:
-            wb.close()
-        except Exception:
-            pass
-        wb = None
-
-        try:
-            app.screen_updating = True
-            app.display_alerts = True
-            app.enable_events = True
-        except Exception:
-            try:
-                app.api.EnableEvents = True
-            except Exception:
-                pass
-
-        # Leave Excel as we found it; reopen briefly so UI lock / open state is consistent
-        wb = app.books.open(saved_path)
-        try:
-            wb.activate()
-        except Exception:
-            pass
-        app = None
+        print("Reopening workbook so AccDB cache warm can run...", flush=True)
+        reopen_workbook_in_app(app, saved_path)
+        app = None  # leave Excel running — do not Quit
     finally:
         if app is not None:
             try:
@@ -655,17 +651,18 @@ def clear_onboard_tblfiles(
                 pass
             if we_started_app:
                 try:
-                    if len(app.books) == 0:
-                        app.quit()
-                except Exception:
-                    pass
-            else:
-                try:
-                    app.screen_updating = True
-                    app.display_alerts = True
-                    app.enable_events = True
+                    from workbook_security import soft_quit_excel_app
+
+                    soft_quit_excel_app(app)
                 except Exception:
                     try:
-                        app.api.EnableEvents = True
+                        app.quit()
                     except Exception:
                         pass
+            else:
+                try:
+                    from workbook_security import restore_excel_interactive
+
+                    restore_excel_interactive(app)
+                except Exception:
+                    pass

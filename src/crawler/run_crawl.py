@@ -34,7 +34,7 @@ def main(argv: list[str] | None = None) -> int:
         "--target",
         choices=("Auto", "Workbook", "AccDB"),
         default=None,
-        help="Index target mode (default Auto via GUI)",
+        help="Index target mode (default AccDB via GUI)",
     )
     parser.add_argument(
         "--no-gui",

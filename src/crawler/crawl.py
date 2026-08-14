@@ -33,6 +33,7 @@ try:
         path_starts_with_root,
         strip_trailing_slash,
         to_unc_path,
+        MIN_SIZE_MB,
     )
 except ImportError:  # python crawl.py (direct / right-click Run)
     _SRC = Path(__file__).resolve().parent.parent
@@ -51,6 +52,7 @@ except ImportError:  # python crawl.py (direct / right-click Run)
         path_starts_with_root,
         strip_trailing_slash,
         to_unc_path,
+        MIN_SIZE_MB,
     )
 
 ENTRY_FILE = "FILE"
@@ -284,6 +286,10 @@ def crawl_parallel(
             )
         )
 
+    retried = _retry_missing_file_sizes(rows, on_progress=emit)
+    if retried:
+        emit(f"size retry: updated {retried:,} file(s) that had missing/zero stats")
+
     stats.files_indexed = sum(1 for r in rows if r.entry_type == ENTRY_FILE)
     stats.folders_indexed = sum(1 for r in rows if r.entry_type == ENTRY_FOLDER)
     stats.bytes_all_files = sum(local_bytes.values())
@@ -294,6 +300,58 @@ def crawl_parallel(
         f"disk_bytes={stats.bytes_all_files:,}"
     )
     return rows, stats
+
+
+def _retry_missing_file_sizes(
+    rows: list[IndexRow],
+    *,
+    on_progress: ProgressCb | None = None,
+    attempts: int = 3,
+    delay_sec: float = 0.15,
+) -> int:
+    """
+    Re-stat FILE rows that landed on the 0.01 MB floor (failed/zero size at crawl).
+    Network shares sometimes need a second look for large files.
+    """
+    need_idx = [
+        i
+        for i, r in enumerate(rows)
+        if r.entry_type == ENTRY_FILE and float(r.size_mb) <= MIN_SIZE_MB
+    ]
+    if not need_idx:
+        return 0
+
+    def emit(msg: str) -> None:
+        if on_progress:
+            on_progress(msg)
+
+    emit(f"size retry: re-statting {len(need_idx):,} file(s) with missing size...")
+    updated = 0
+    for n, i in enumerate(need_idx, start=1):
+        path = rows[i].path
+        size_bytes = 0
+        for attempt in range(max(1, attempts)):
+            try:
+                size_bytes = int(os.stat(path, follow_symlinks=False).st_size)
+                if size_bytes > 0:
+                    break
+            except OSError:
+                size_bytes = 0
+            if attempt + 1 < attempts:
+                time.sleep(delay_sec)
+        if size_bytes > 0:
+            new_mb = bytes_to_size_mb(size_bytes)
+            if new_mb > MIN_SIZE_MB:
+                rows[i] = IndexRow(
+                    path=rows[i].path,
+                    file_date=rows[i].file_date,
+                    size_mb=new_mb,
+                    entry_type=rows[i].entry_type,
+                )
+                updated += 1
+        if n % 100 == 0:
+            emit(f"size retry: {n:,}/{len(need_idx):,} checked, updated={updated:,}")
+    return updated
 
 
 def write_csv(rows: list[IndexRow], out_path: Path) -> None:
@@ -364,8 +422,246 @@ def _accdb_connection_strings(out_path: Path) -> list[str]:
     ]
 
 
-def write_accdb(rows: list[IndexRow], out_path: Path) -> None:
-    """Write IndexRow data to Access .accdb (tblFiles + indexes). Creates file if missing."""
+@dataclass
+class IngestLogRow:
+    """Mirrors Ingestion!tblIngested (Links already Eaten)."""
+
+    root_path: str
+    date_ingested: str  # yyyy-mm-dd
+    file_count: int
+    folder_count: int
+    total_size_mb: float
+
+
+def ingest_stats_from_rows(rows: list[IndexRow]) -> tuple[int, int, float]:
+    """FileCount, FolderCount, TotalSizeMB — FILE SizeMB sum (matches VBA / sheet import)."""
+    files = 0
+    folders = 0
+    size_mb = 0.0
+    for r in rows:
+        if r.entry_type == ENTRY_FOLDER:
+            folders += 1
+        else:
+            files += 1
+            size_mb += float(r.size_mb)
+    return files, folders, round(size_mb, 2)
+
+
+def _norm_ingest_root(path: str) -> str:
+    return strip_trailing_slash(path).lower()
+
+
+def _is_synthetic_ingest_root(path: str) -> bool:
+    return strip_trailing_slash(path).lower() in ("(accdb index)", "")
+
+
+def _merge_ingest_log(
+    existing: list[IngestLogRow],
+    new_row: IngestLogRow,
+) -> list[IngestLogRow]:
+    """Upsert one scan root; drop exact match + child roots (ReplaceRoot)."""
+    parent = strip_trailing_slash(new_row.root_path)
+    parent_key = _norm_ingest_root(parent)
+    keep: list[IngestLogRow] = []
+    for row in existing:
+        path = strip_trailing_slash(row.root_path)
+        if _is_synthetic_ingest_root(path):
+            continue
+        key = _norm_ingest_root(path)
+        if key == parent_key:
+            continue
+        if path_starts_with_root(path, parent):
+            continue
+        keep.append(row)
+    keep.append(
+        IngestLogRow(
+            root_path=parent,
+            date_ingested=new_row.date_ingested,
+            file_count=new_row.file_count,
+            folder_count=new_row.folder_count,
+            total_size_mb=new_row.total_size_mb,
+        )
+    )
+    keep.sort(key=lambda r: r.root_path.lower())
+    return keep
+
+
+def _accdb_table_exists(cur, table_name: str) -> bool:
+    try:
+        cur.execute(f"SELECT TOP 1 * FROM [{table_name}]")
+        cur.fetchone()
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _ensure_accdb_tables(cur, conn) -> None:
+    if not _accdb_table_exists(cur, "tblFiles"):
+        cur.execute(
+            """
+            CREATE TABLE tblFiles (
+                FilePath TEXT NOT NULL,
+                FileDate TEXT,
+                SizeMB DOUBLE NOT NULL,
+                EntryType TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+        try:
+            cur.execute("CREATE INDEX ix_tblFiles_path ON tblFiles (FilePath)")
+            cur.execute("CREATE INDEX ix_tblFiles_type ON tblFiles (EntryType)")
+            conn.commit()
+        except Exception:  # noqa: BLE001
+            conn.rollback()
+
+    if not _accdb_table_exists(cur, "tblIngested"):
+        cur.execute(
+            """
+            CREATE TABLE tblIngested (
+                RootPath TEXT NOT NULL,
+                DateIngested TEXT,
+                FileCount INTEGER,
+                FolderCount INTEGER,
+                TotalSizeMB DOUBLE
+            )
+            """
+        )
+        conn.commit()
+
+
+def _read_accdb_ingest_log(cur) -> list[IngestLogRow]:
+    if not _accdb_table_exists(cur, "tblIngested"):
+        return []
+    rows: list[IngestLogRow] = []
+    cur.execute(
+        "SELECT RootPath, DateIngested, FileCount, FolderCount, TotalSizeMB "
+        "FROM tblIngested ORDER BY RootPath"
+    )
+    for rec in cur.fetchall():
+        root = strip_trailing_slash(str(rec[0] or "").strip())
+        if _is_synthetic_ingest_root(root):
+            continue
+        date_val = rec[1]
+        if date_val is None:
+            date_txt = ""
+        elif hasattr(date_val, "isoformat"):
+            date_txt = date_val.isoformat()[:10]
+        else:
+            date_txt = str(date_val).strip()[:10]
+        try:
+            files = int(rec[2] or 0)
+        except (TypeError, ValueError):
+            files = 0
+        try:
+            folders = int(rec[3] or 0)
+        except (TypeError, ValueError):
+            folders = 0
+        try:
+            size_mb = round(float(rec[4] or 0), 2)
+        except (TypeError, ValueError):
+            size_mb = 0.0
+        rows.append(
+            IngestLogRow(
+                root_path=root,
+                date_ingested=date_txt,
+                file_count=files,
+                folder_count=folders,
+                total_size_mb=size_mb,
+            )
+        )
+    return rows
+
+
+def _delete_accdb_files_under_root(cur, root: str) -> int:
+    """Delete tblFiles rows for this root (exact + descendants). Returns deleted estimate."""
+    root = strip_trailing_slash(root)
+    if not root:
+        return 0
+    prefix = root + "\\"
+    root_u = root.upper()
+    prefix_u = prefix.upper()
+    cur.execute(
+        "DELETE FROM tblFiles WHERE UCase(FilePath)=? OR Left(UCase(FilePath),?)=?",
+        (root_u, len(prefix_u), prefix_u),
+    )
+    return cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0
+
+
+def _rewrite_accdb_ingest_log(cur, conn, log_rows: list[IngestLogRow]) -> None:
+    try:
+        cur.execute("DELETE FROM tblIngested")
+        conn.commit()
+    except Exception:  # noqa: BLE001
+        conn.rollback()
+        cur.execute("DROP TABLE tblIngested")
+        conn.commit()
+        cur.execute(
+            """
+            CREATE TABLE tblIngested (
+                RootPath TEXT NOT NULL,
+                DateIngested TEXT,
+                FileCount INTEGER,
+                FolderCount INTEGER,
+                TotalSizeMB DOUBLE
+            )
+            """
+        )
+        conn.commit()
+
+    if not log_rows:
+        return
+    cur.executemany(
+        "INSERT INTO tblIngested "
+        "(RootPath, DateIngested, FileCount, FolderCount, TotalSizeMB) "
+        "VALUES (?, ?, ?, ?, ?)",
+        [
+            (
+                strip_trailing_slash(r.root_path),
+                r.date_ingested or None,
+                int(r.file_count),
+                int(r.folder_count),
+                float(r.total_size_mb),
+            )
+            for r in log_rows
+            if not _is_synthetic_ingest_root(r.root_path)
+        ],
+    )
+    conn.commit()
+
+
+def _insert_accdb_file_rows(cur, conn, rows: list[IndexRow]) -> None:
+    insert_sql = (
+        "INSERT INTO tblFiles (FilePath, FileDate, SizeMB, EntryType) VALUES (?, ?, ?, ?)"
+    )
+    batch: list[tuple[str, str | None, float, str]] = []
+    batch_size = 500
+    for r in rows:
+        batch.append((r.path, r.file_date or None, float(r.size_mb), r.entry_type))
+        if len(batch) >= batch_size:
+            cur.executemany(insert_sql, batch)
+            conn.commit()
+            batch.clear()
+    if batch:
+        cur.executemany(insert_sql, batch)
+        conn.commit()
+
+
+def write_accdb(
+    rows: list[IndexRow],
+    out_path: Path,
+    *,
+    crawl_root: str | None = None,
+    ingest_log: list[IngestLogRow] | None = None,
+    replace_root: bool = True,
+) -> None:
+    """
+    Write crawl rows into AccDB tblFiles and accumulate scan roots in tblIngested.
+
+    Default replace_root=True: keep other roots' files + ingest history; replace only
+    this crawl_root (and child ingest entries). Full wipe only when replace_root=False
+    or the AccDB file is new.
+    """
     try:
         import pyodbc  # type: ignore
     except ImportError as exc:
@@ -376,16 +672,20 @@ def write_accdb(rows: list[IndexRow], out_path: Path) -> None:
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Rebuild cleanly: recreate file then bulk insert (avoids stale schema / locks when possible)
-    if out_path.exists():
-        try:
-            out_path.unlink()
-        except OSError:
-            # File locked — drop table in place instead
-            pass
+    root = strip_trailing_slash((crawl_root or "").strip())
+    files, folders, size_mb = ingest_stats_from_rows(rows)
+    new_ingest = IngestLogRow(
+        root_path=root,
+        date_ingested=dt.date.today().isoformat(),
+        file_count=files,
+        folder_count=folders,
+        total_size_mb=size_mb,
+    ) if root else None
 
+    created_new = False
     if not out_path.exists():
         _create_empty_accdb(out_path)
+        created_new = True
 
     conn = None
     last_err: Exception | None = None
@@ -403,42 +703,50 @@ def write_accdb(rows: list[IndexRow], out_path: Path) -> None:
 
     try:
         cur = conn.cursor()
-        try:
-            cur.execute("DROP TABLE tblFiles")
-            conn.commit()
-        except Exception:  # noqa: BLE001
-            conn.rollback()
+        _ensure_accdb_tables(cur, conn)
 
-        cur.execute(
-            """
-            CREATE TABLE tblFiles (
-                FilePath TEXT NOT NULL,
-                FileDate TEXT,
-                SizeMB DOUBLE NOT NULL,
-                EntryType TEXT NOT NULL
-            )
-            """
-        )
-        conn.commit()
+        existing_log = _read_accdb_ingest_log(cur) if not created_new else []
 
-        insert_sql = (
-            "INSERT INTO tblFiles (FilePath, FileDate, SizeMB, EntryType) VALUES (?, ?, ?, ?)"
-        )
-        batch: list[tuple[str, str | None, float, str]] = []
-        batch_size = 500
-        for r in rows:
-            batch.append((r.path, r.file_date or None, float(r.size_mb), r.entry_type))
-            if len(batch) >= batch_size:
-                cur.executemany(insert_sql, batch)
+        full_rebuild = created_new or (not replace_root) or (not root)
+        if full_rebuild:
+            try:
+                cur.execute("DELETE FROM tblFiles")
                 conn.commit()
-                batch.clear()
-        if batch:
-            cur.executemany(insert_sql, batch)
-            conn.commit()
+            except Exception:  # noqa: BLE001
+                conn.rollback()
+            _insert_accdb_file_rows(cur, conn, rows)
+            if ingest_log is not None:
+                log_rows = [
+                    r for r in ingest_log if not _is_synthetic_ingest_root(r.root_path)
+                ]
+            elif new_ingest is not None:
+                log_rows = [new_ingest]
+            else:
+                log_rows = []
+            _rewrite_accdb_ingest_log(cur, conn, log_rows)
+            print(
+                f"AccDB full write: files={len(rows):,} ingest_scans={len(log_rows)}",
+                flush=True,
+            )
+            return
 
-        cur.execute("CREATE INDEX ix_tblFiles_path ON tblFiles (FilePath)")
-        cur.execute("CREATE INDEX ix_tblFiles_type ON tblFiles (EntryType)")
+        # ReplaceRoot merge: keep other roots, replace this root's files + ingest row
+        deleted = _delete_accdb_files_under_root(cur, root)
         conn.commit()
+        _insert_accdb_file_rows(cur, conn, rows)
+        assert new_ingest is not None
+        if ingest_log is not None:
+            log_rows = [
+                r for r in ingest_log if not _is_synthetic_ingest_root(r.root_path)
+            ]
+        else:
+            log_rows = _merge_ingest_log(existing_log, new_ingest)
+        _rewrite_accdb_ingest_log(cur, conn, log_rows)
+        print(
+            f"AccDB ReplaceRoot: removed~{deleted} prior rows under {root}; "
+            f"ingest scans now={len(log_rows)}",
+            flush=True,
+        )
     finally:
         conn.close()
 
@@ -560,9 +868,9 @@ def run_interactive(
 
     root = ""
     wb_path: Path | None = None
-    mode = (target_mode or "Auto").strip() or "Auto"
+    mode = (target_mode or "AccDB").strip() or "AccDB"
     if mode not in ("Auto", "Workbook", "AccDB"):
-        mode = "Auto"
+        mode = "AccDB"
 
     if use_gui and workbook is None and target_mode is None:
         try:
@@ -665,8 +973,8 @@ def run_interactive(
         if force_accdb:
             assert accdb_out is not None
             print(f"Writing AccDB -> {accdb_out} ...", flush=True)
-            write_accdb(rows, accdb_out)
-            print(f"Wrote AccDB ({len(rows):,} rows).", flush=True)
+            write_accdb(rows, accdb_out, crawl_root=unc)
+            print(f"Wrote AccDB ({len(rows):,} rows + ingestion log).", flush=True)
             try:
                 from .import_to_excel import clear_onboard_tblfiles
             except ImportError:

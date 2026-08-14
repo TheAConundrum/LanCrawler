@@ -44,35 +44,18 @@ Public Sub SetStatus(ByVal message As String)
     On Error GoTo 0
 End Sub
 
-Public Sub ClearStatus()
-    ' Avoid leaving the literal word "FALSE" in the status bar (Excel quirk).
-    On Error Resume Next
-    Application.DisplayStatusBar = True
-    Application.StatusBar = vbNullString
-    Application.StatusBar = False
-    On Error GoTo 0
-End Sub
-
 Public Sub Restore()
     On Error Resume Next
     If mCaptured Then
         Application.ScreenUpdating = mScreenUpdating
         Application.EnableEvents = mEnableEvents
         Application.DisplayAlerts = mDisplayAlerts
-        If mStatusBarIsDefault Or VarType(mStatusBar) = vbBoolean Then
-            Application.StatusBar = vbNullString
-            Application.StatusBar = False
-        ElseIf Len(CStr(mStatusBar & "")) = 0 Then
-            Application.StatusBar = vbNullString
-            Application.StatusBar = False
-        Else
-            Application.StatusBar = CStr(mStatusBar)
-        End If
+        ' Always hand status bar back to Excel — never CStr(False) → "FALSE"
+        Application.StatusBar = False
     Else
         Application.ScreenUpdating = True
         Application.EnableEvents = True
         Application.DisplayAlerts = True
-        Application.StatusBar = vbNullString
         Application.StatusBar = False
     End If
     On Error GoTo 0

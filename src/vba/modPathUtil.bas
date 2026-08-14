@@ -62,11 +62,26 @@ Public Function BytesToSizeMb(ByVal sizeBytes As Double) As Double
     End If
 End Function
 
-' Normalize a stored size cell: migrate legacy SizeBytes (>1000) to MB, else clamp/round.
+' Normalize a stored size cell to SizeMB.
+' Never use (stored & 0) — that concatenates ("445" & 0 = "4450") and corrupts whole MB values,
+' which then looked like "bytes" and displayed as 0.01 while still matching SizeMB>50 in AccDB.
+' Legacy SizeBytes migration: only treat values >= 1,000,000 as raw bytes (~1 MB+ in bytes).
 Public Function CoerceStoredSizeMb(ByVal stored As Variant) As Double
     Dim v As Double
     On Error Resume Next
-    v = CDbl(stored & 0)
+    If IsNull(stored) Or IsEmpty(stored) Then
+        CoerceStoredSizeMb = MIN_SIZE_MB
+        Exit Function
+    End If
+    If VarType(stored) = vbString Then
+        If Len(Trim$(CStr(stored))) = 0 Then
+            CoerceStoredSizeMb = MIN_SIZE_MB
+            Exit Function
+        End If
+        v = Val(Replace(CStr(stored), ",", "."))
+    Else
+        v = CDbl(stored)
+    End If
     If Err.Number <> 0 Then
         Err.Clear
         CoerceStoredSizeMb = MIN_SIZE_MB
@@ -74,7 +89,8 @@ Public Function CoerceStoredSizeMb(ByVal stored As Variant) As Double
     End If
     On Error GoTo 0
 
-    If v > 1000# Then
+    ' >= 1e6 cannot be a realistic single-file SizeMB; treat as legacy SizeBytes
+    If v >= 1000000# Then
         CoerceStoredSizeMb = BytesToSizeMb(v)
     ElseIf v <= 0# Then
         CoerceStoredSizeMb = MIN_SIZE_MB
@@ -279,63 +295,6 @@ Public Function FileNameOnly(ByVal fullPath As String) As String
     Else
         FileNameOnly = Mid$(p, slash + 1)
     End If
-End Function
-
-' File name without extension (for Dashboard File column display).
-Public Function FileNameWithoutExtension(ByVal fullPath As String) As String
-    Dim name As String
-    Dim dot As Long
-    name = FileNameOnly(fullPath)
-    If Len(name) = 0 Then
-        FileNameWithoutExtension = vbNullString
-        Exit Function
-    End If
-    dot = InStrRev(name, ".")
-    If dot <= 1 Then
-        FileNameWithoutExtension = name
-    Else
-        FileNameWithoutExtension = Left$(name, dot - 1)
-    End If
-End Function
-
-' Returns a 1-based unique list preserving first-seen order.
-' If empty, returns an uninitialized array (use IsArray + check bounds carefully).
-Public Function UniqueStrings(ByRef values() As Variant) As Variant()
-    Dim dict As Object
-    Dim i As Long
-    Dim key As String
-    Dim out() As Variant
-    Dim n As Long
-    Dim k As Variant
-
-    Set dict = CreateObject("Scripting.Dictionary")
-    dict.CompareMode = 1 ' TextCompare
-
-    If Not IsArray(values) Then
-        UniqueStrings = out
-        Exit Function
-    End If
-
-    For i = LBound(values) To UBound(values)
-        key = CStr(values(i) & "")
-        If Len(key) > 0 Then
-            If Not dict.Exists(key) Then dict.Add key, key
-        End If
-    Next i
-
-    If dict.Count = 0 Then
-        UniqueStrings = out
-        Exit Function
-    End If
-
-    ReDim out(1 To dict.Count)
-    n = 1
-    For Each k In dict.Keys
-        out(n) = CStr(k)
-        n = n + 1
-    Next k
-
-    UniqueStrings = out
 End Function
 
 ' Flexible match: lowercase and strip punctuation separators; keep \ and /.

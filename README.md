@@ -12,7 +12,7 @@ LAN file-index crawler + Excel VBA search tool.
 
 ## Index backends (exclusive, no hybrid)
 
-On workbook open: if onboard `Database!tblFiles` is non-empty → sheet searches for the session; if empty → AccDB at `{workbook}\DB\LAN_Search_Index.accdb`. AccDB crawls clear the sheet so it cannot shadow AccDB.
+On workbook open: if `{workbook}\DB\LAN_Search_Index.accdb` exists → AccDB (Ingestion restored from `tblIngested`); else if onboard `Database!tblFiles` is non-empty → sheet; else empty (Ingestion cleared). AccDB crawls clear the sheet so AccDB stays exclusive.
 
 ## Not in git
 
