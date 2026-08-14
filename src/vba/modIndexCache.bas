@@ -3,7 +3,8 @@ Option Explicit
 Option Private Module
 
 ' Exclusive session index backend:
-'   AccDB  — {workbook}\DB\LAN_Search_Index.accdb exists (preferred when present)
+'   AccDB  — {workbook}\DB\SearchIndex-{M}-{D}-{YYYY}.accdb (newest dated snapshot;
+'            falls back to LAN_Search_Index.accdb if no dated file exists)
 '   Sheet  — no AccDB and onboard Database!tblFiles is non-empty
 '   Empty  — neither available
 ' No hybrid merge. Resolve once on warm / EnsureResolved.
@@ -11,7 +12,8 @@ Option Private Module
 Private Const SHEET_DATABASE As String = "Database"
 Private Const TABLE_FILES As String = "tblFiles"
 Private Const ACCDB_DIR As String = "DB"
-Private Const ACCDB_FILE As String = "LAN_Search_Index.accdb"
+Private Const ACCDB_PREFIX As String = "SearchIndex-"
+Private Const ACCDB_FILE_LEGACY As String = "LAN_Search_Index.accdb"
 
 Public Const BACKEND_EMPTY As String = "Empty"
 Public Const BACKEND_SHEET As String = "Sheet"
@@ -20,6 +22,7 @@ Public Const BACKEND_ACCDB As String = "AccDB"
 Private mBackend As String
 Private mResolved As Boolean
 Private mWorkbookPath As String
+Private mAccdbResolvedPath As String
 
 ' Slim sheet cache (FilePath-based search only — no parent/descendant arrays)
 Private mData As Variant
@@ -55,6 +58,8 @@ End Function
 
 Public Function AccdbPath(Optional ByVal wb As Workbook = Nothing) As String
     Dim base As String
+    Dim folder As String
+    Dim found As String
     If wb Is Nothing Then Set wb = ActiveWorkbook
     If wb Is Nothing Then
         AccdbPath = vbNullString
@@ -65,7 +70,92 @@ Public Function AccdbPath(Optional ByVal wb As Workbook = Nothing) As String
         AccdbPath = vbNullString
         Exit Function
     End If
-    AccdbPath = base & "\" & ACCDB_DIR & "\" & ACCDB_FILE
+    folder = base & "\" & ACCDB_DIR
+    found = LatestSearchIndexPath(folder)
+    If Len(found) > 0 Then
+        AccdbPath = found
+    Else
+        AccdbPath = folder & "\" & AccdbFileNameForDate(Date)
+    End If
+End Function
+
+Private Function AccdbFileNameForDate(ByVal d As Date) As String
+    AccdbFileNameForDate = ACCDB_PREFIX & Month(d) & "-" & Day(d) & "-" & Year(d) & ".accdb"
+End Function
+
+Private Function ParseSearchIndexDate(ByVal fileName As String) As Date
+    Dim stem As String
+    Dim rest As String
+    Dim parts() As String
+    Dim m As Long
+    Dim d As Long
+    Dim y As Long
+
+    ParseSearchIndexDate = 0
+    stem = fileName
+    If StrComp(Right$(stem, 6), ".accdb", vbTextCompare) = 0 Then
+        stem = Left$(stem, Len(stem) - 6)
+    End If
+    If StrComp(Left$(stem, Len(ACCDB_PREFIX)), ACCDB_PREFIX, vbTextCompare) <> 0 Then
+        Exit Function
+    End If
+    rest = Mid$(stem, Len(ACCDB_PREFIX) + 1)
+    parts = Split(rest, "-")
+    If UBound(parts) <> 2 Then Exit Function
+    On Error Resume Next
+    m = CLng(parts(0))
+    d = CLng(parts(1))
+    y = CLng(parts(2))
+    If Err.Number <> 0 Then Exit Function
+    On Error GoTo 0
+    If m < 1 Or m > 12 Or d < 1 Or d > 31 Or y < 1900 Then Exit Function
+    On Error Resume Next
+    ParseSearchIndexDate = DateSerial(y, m, d)
+    If Err.Number <> 0 Then ParseSearchIndexDate = 0
+End Function
+
+Private Function LatestSearchIndexPath(ByVal folder As String) As String
+    Dim fso As Object
+    Dim fld As Object
+    Dim f As Object
+    Dim bestPath As String
+    Dim bestDate As Date
+    Dim parsed As Date
+    Dim hasBest As Boolean
+    Dim legacyPath As String
+
+    LatestSearchIndexPath = vbNullString
+    On Error GoTo Fail
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    If Not fso.FolderExists(folder) Then Exit Function
+    Set fld = fso.GetFolder(folder)
+
+    hasBest = False
+    For Each f In fld.Files
+        If StrComp(Right$(f.Name, 6), ".accdb", vbTextCompare) = 0 Then
+            parsed = ParseSearchIndexDate(f.Name)
+            If parsed > 0 Then
+                If (Not hasBest) Or parsed > bestDate Then
+                    hasBest = True
+                    bestDate = parsed
+                    bestPath = CStr(f.Path)
+                End If
+            End If
+        End If
+    Next f
+
+    If hasBest Then
+        LatestSearchIndexPath = bestPath
+        Exit Function
+    End If
+
+    legacyPath = folder & "\" & ACCDB_FILE_LEGACY
+    If fso.FileExists(legacyPath) Then
+        LatestSearchIndexPath = legacyPath
+    End If
+    Exit Function
+Fail:
+    LatestSearchIndexPath = vbNullString
 End Function
 
 Public Function AccdbExists(Optional ByVal wb As Workbook = Nothing) As Boolean
@@ -167,6 +257,7 @@ Public Sub ResolveIndexBackend(Optional ByVal wb As Workbook = Nothing)
     ' AccDB wins when present (sheet leftovers must not shadow AccDB-Blank crawls)
     If AccdbExists(wb) Then
         mBackend = BACKEND_ACCDB
+        mAccdbResolvedPath = AccdbPath(wb)
         mRowCount = AccdbRowCount(wb)
         mSheetLoaded = False
         mData = Empty
@@ -214,8 +305,14 @@ Private Function BackendStillValid(ByVal wb As Workbook) As Boolean
 
     Select Case mBackend
         Case BACKEND_ACCDB
-            ' AccDB deleted from DB\ → invalid (must clear Ingestion / fall back)
-            BackendStillValid = AccdbExists(wb)
+            ' AccDB deleted, or a newer dated SearchIndex-*.accdb appeared
+            If Len(mAccdbResolvedPath) = 0 Then
+                BackendStillValid = False
+            ElseIf StrComp(AccdbPath(wb), mAccdbResolvedPath, vbTextCompare) <> 0 Then
+                BackendStillValid = False
+            Else
+                BackendStillValid = (Len(Dir$(mAccdbResolvedPath)) > 0)
+            End If
         Case BACKEND_SHEET
             ' AccDB appeared → prefer AccDB; sheet emptied → re-resolve
             BackendStillValid = (Not AccdbExists(wb)) And SheetTblFilesNonEmpty(wb)
@@ -285,6 +382,7 @@ Public Sub InvalidateIndex()
     mResolved = False
     mBackend = BACKEND_EMPTY
     mWorkbookPath = vbNullString
+    mAccdbResolvedPath = vbNullString
     Debug.Print "INDEX: invalidated"
 End Sub
 
@@ -332,13 +430,8 @@ Public Sub CollectPathHits(ByVal term1 As String, ByVal op As String, ByVal term
             If Not includeFiles Then GoTo NextRow
         End If
 
-        ' Folders: match the folder's own name only (not ancestor names in the path).
-        ' Files: still match the full path so hits under a named folder remain visible.
-        If isFolder Then
-            matched = modPathUtil.FolderLeafMatchesCriteria(path, term1, op, term2, flexible, extraAndTerm)
-        Else
-            matched = modPathUtil.TextMatchesCriteria(path, term1, op, term2, flexible, extraAndTerm)
-        End If
+        ' File and folder rows match their own name only (not ancestor folder names).
+        matched = modPathUtil.SearchHitMatches(path, extraAndTerm, term1, op, term2, flexible, Len(Trim$(extraAndTerm)) > 0)
         If Not matched Then GoTo NextRow
 
         sizeVal = modPathUtil.CoerceStoredSizeMb(mData(i, 3))

@@ -116,11 +116,6 @@ def enforce_workbook_ui_lock(wb: Any) -> None:
     d = dash.api
     _unprotect_sheet_api(d)
     try:
-        d.Cells.Locked = True
-        for addr in ("A3", "D3", "G3", "A5"):
-            _unlock_addr(d, addr)
-        for addr in ("C3", "F3", "H3", "I3", "H5"):
-            _unlock_addr(d, addr)
         d.Columns(21).Locked = False  # U — hidden UNC targets
         d.Columns(21).Hidden = True
         d.Columns(13).ColumnWidth = 10  # M Size MB
@@ -138,7 +133,7 @@ def enforce_workbook_ui_lock(wb: Any) -> None:
         _set_list_validation(d, "I3", "Yes,No,Only")
     except Exception as exc:
         print(f"  [!] Dashboard lock flags: {exc}", flush=True)
-    _protect_sheet_api(d, allow_formatting_columns=True, allow_filtering=True)
+    # Dashboard stays unprotected so results AutoFilter/copy work.
 
     try:
         ing = wb.sheets["Ingestion"]

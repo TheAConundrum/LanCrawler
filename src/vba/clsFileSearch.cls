@@ -172,10 +172,11 @@ Private Sub SearchIndex(ByVal hits As Object, ByRef anyCriteria As Boolean)
     hasSizeFilter = ParseSizeFilter(sizeOp, mMap.CriteriaSizeMbValue, sizeMb)
     extraAnd = vbNullString
 
-    ' File Search (A5) is the main box. Contains row is optional advanced filter.
-    If Len(fileTerm) > 0 And Len(term1) > 0 Then
+    ' File Search (A5) is the main box. Contains A3 / Op / D3 refine the same search.
+    ' Example: A5=NORM-24-233, A3=pdf, Op=NOT, D3=working → name has NORM-24-233,
+    ' path has pdf, path does not have working.
+    If Len(fileTerm) > 0 And (Len(term1) > 0 Or Len(term2) > 0) Then
         extraAnd = fileTerm
-        ' term1/op/term2 stay as criteria Contains clause
     ElseIf Len(fileTerm) > 0 Then
         term1 = fileTerm
         op = vbNullString
@@ -187,7 +188,7 @@ Private Sub SearchIndex(ByVal hits As Object, ByRef anyCriteria As Boolean)
                 " shareFilter=" & shareFilter & " n=" & CStr(modIndexCache.IndexRowCount) & _
                 " term1=" & term1 & " extraAnd=" & extraAnd
 
-    If Len(term1) = 0 Then
+    If Len(term1) = 0 And Len(extraAnd) = 0 Then
         anyCriteria = False
         Exit Sub
     End If
@@ -241,22 +242,11 @@ Private Sub SearchAccdbCriteria(ByVal cn As Object, ByVal hits As Object, _
     Dim isFolder As Boolean
     Dim sizeVal As Double
     Dim dt As Variant
-    Dim t1 As String
-    Dim t2 As String
-    Dim extraN As String
 
-    t1 = term1
-    t2 = term2
-    extraN = Trim$(extraAndTerm)
-    If flexible Then
-        t1 = modPathUtil.NormalizeForMatch(term1)
-        If Len(Trim$(term2)) > 0 Then t2 = modPathUtil.NormalizeForMatch(term2)
-        If Len(extraN) > 0 Then extraN = modPathUtil.NormalizeForMatch(extraN)
-        If Len(t1) = 0 Then Exit Sub
-    End If
-
-    whereSql = BuildAccdbWhere(t1, op, t2, includeFiles, includeFolders, _
-                               hasSizeFilter, sizeOp, sizeMb, shareFilter, extraN)
+    ' SQL uses the original term (or flexible tokens). Never pass NormalizeForMatch
+    ' into InStr([FilePath]) — "norm24233" will not hit "NORM-24-233" on disk.
+    whereSql = BuildAccdbWhere(term1, op, term2, includeFiles, includeFolders, _
+                               hasSizeFilter, sizeOp, sizeMb, shareFilter, extraAndTerm, flexible)
     If Len(Trim$(whereSql)) = 0 Or whereSql = "()" Then
         Err.Raise vbObjectError + 3, , "AccDB search produced an empty WHERE clause."
     End If
@@ -274,16 +264,8 @@ Private Sub SearchAccdbCriteria(ByVal cn As Object, ByVal hits As Object, _
             et = UCase$(Trim$(CStr(rs.Fields("EntryType").Value & "")))
             If Len(et) = 0 Then et = "FILE"
             isFolder = (et = "FOLDER")
-            ' Folders: own name must match. SQL InStr on FilePath also hits descendants
-            ' of a matching ancestor (Pics, IM-000020, ...); drop those here.
-            If isFolder Then
-                If Not modPathUtil.FolderLeafMatchesCriteria(path, term1, op, term2, flexible, extraAndTerm) Then GoTo NextRec
-            ElseIf flexible Then
-                If Not FlexiblePathMatches(path, t1, op, t2) Then GoTo NextRec
-                If Len(extraN) > 0 Then
-                    If InStr(1, modPathUtil.NormalizeForMatch(path), extraN, vbBinaryCompare) = 0 Then GoTo NextRec
-                End If
-            End If
+            ' A5 = leaf name; Contains row (when extraAnd is set) refines against the full path.
+            If Not modPathUtil.SearchHitMatches(path, extraAndTerm, term1, op, term2, flexible, Len(Trim$(extraAndTerm)) > 0) Then GoTo NextRec
             sizeVal = modPathUtil.CoerceStoredSizeMb(rs.Fields("SizeMB").Value)
             If hasSizeFilter Then
                 If sizeOp = "OVER" Then
@@ -303,49 +285,32 @@ NextRec:
     rs.Close
 End Sub
 
-Private Function FlexiblePathMatches(ByVal path As String, ByVal term1N As String, _
-                                     ByVal op As String, ByVal term2N As String) As Boolean
-    Dim hay As String
-    Dim has1 As Boolean
-    Dim has2 As Boolean
-    Dim hasTerm2 As Boolean
-
-    hay = modPathUtil.NormalizeForMatch(path)
-    has1 = (InStr(1, hay, term1N, vbBinaryCompare) > 0)
-    hasTerm2 = (Len(term2N) > 0 And Len(op) > 0)
-    If hasTerm2 Then
-        has2 = (InStr(1, hay, term2N, vbBinaryCompare) > 0)
-        Select Case UCase$(op)
-            Case "AND": FlexiblePathMatches = has1 And has2
-            Case "OR": FlexiblePathMatches = has1 Or has2
-            Case "NOT": FlexiblePathMatches = has1 And (Not has2)
-            Case Else: FlexiblePathMatches = has1
-        End Select
-    Else
-        FlexiblePathMatches = has1
-    End If
-End Function
-
 Private Function BuildAccdbWhere(ByVal term1 As String, ByVal op As String, ByVal term2 As String, _
                                  ByVal includeFiles As Boolean, ByVal includeFolders As Boolean, _
                                  ByVal hasSizeFilter As Boolean, ByVal sizeOp As String, ByVal sizeMb As Double, _
                                  ByVal shareFilter As String, _
-                                 Optional ByVal extraAndTerm As String = "") As String
+                                 Optional ByVal extraAndTerm As String = "", _
+                                 Optional ByVal flexible As Boolean = False) As String
     Dim parts As String
     Dim kw As String
     Dim shareEsc As String
     Dim extra As String
 
-    kw = KeywordClause(term1, op, term2)
-    If Len(Trim$(kw)) = 0 Then
+    kw = KeywordClause(term1, op, term2, flexible)
+    extra = Trim$(extraAndTerm)
+    If Len(Trim$(kw)) = 0 And Len(extra) = 0 Then
         BuildAccdbWhere = vbNullString
         Exit Function
     End If
-    parts = "(" & kw & ")"
-
-    extra = Trim$(extraAndTerm)
+    If Len(Trim$(kw)) > 0 Then
+        parts = "(" & kw & ")"
+    End If
     If Len(extra) > 0 Then
-        parts = parts & " AND (" & PathContainsClause(extra) & ")"
+        If Len(parts) > 0 Then
+            parts = parts & " AND (" & PathContainsClause(extra, flexible) & ")"
+        Else
+            parts = "(" & PathContainsClause(extra, flexible) & ")"
+        End If
     End If
 
     If includeFiles And Not includeFolders Then
@@ -371,23 +336,31 @@ Private Function BuildAccdbWhere(ByVal term1 As String, ByVal op As String, ByVa
     BuildAccdbWhere = parts
 End Function
 
-Private Function KeywordClause(ByVal term1 As String, ByVal op As String, ByVal term2 As String) As String
+Private Function KeywordClause(ByVal term1 As String, ByVal op As String, ByVal term2 As String, _
+                               Optional ByVal flexible As Boolean = False) As String
     Dim c1 As String
     Dim c2 As String
     Dim hasTerm2 As Boolean
 
     ' InStr is reliable via ACE/ADODB; LIKE %/* wildcard mode varies by ANSI setting.
-    c1 = PathContainsClause(term1)
+    c1 = PathContainsClause(term1, flexible)
+    hasTerm2 = (Len(Trim$(term2)) > 0 And Len(Trim$(op)) > 0)
     If Len(c1) = 0 Then
+        If hasTerm2 And UCase$(Trim$(op)) = "NOT" Then
+            c2 = PathContainsClause(term2, flexible)
+            If Len(c2) > 0 Then
+                KeywordClause = "NOT (" & c2 & ")"
+                Exit Function
+            End If
+        End If
         KeywordClause = vbNullString
         Exit Function
     End If
-    hasTerm2 = (Len(Trim$(term2)) > 0 And Len(Trim$(op)) > 0)
     If Not hasTerm2 Then
         KeywordClause = c1
         Exit Function
     End If
-    c2 = PathContainsClause(term2)
+    c2 = PathContainsClause(term2, flexible)
     If Len(c2) = 0 Then
         KeywordClause = c1
         Exit Function
@@ -404,14 +377,39 @@ Private Function KeywordClause(ByVal term1 As String, ByVal op As String, ByVal 
     End Select
 End Function
 
-Private Function PathContainsClause(ByVal term As String) As String
+Private Function PathContainsClause(ByVal term As String, Optional ByVal flexible As Boolean = False) As String
     Dim t As String
+    Dim tokens As Variant
+    Dim i As Long
+    Dim parts As String
+    Dim tok As String
+
     t = Trim$(term)
     If Len(t) = 0 Then
         PathContainsClause = vbNullString
         Exit Function
     End If
-    ' Case-insensitive path substring match
+
+    If flexible Then
+        tokens = modPathUtil.SplitFlexibleTokens(t)
+        If IsArray(tokens) Then
+            If UBound(tokens) >= LBound(tokens) Then
+                For i = LBound(tokens) To UBound(tokens)
+                    tok = CStr(tokens(i) & "")
+                    If Len(tok) > 0 Then
+                        If Len(parts) > 0 Then parts = parts & " AND "
+                        parts = parts & "InStr(1, LCase([FilePath]), LCase('" & EscapeAccessString(tok) & "'))>0"
+                    End If
+                Next i
+            End If
+        End If
+        If Len(parts) > 0 Then
+            PathContainsClause = "(" & parts & ")"
+            Exit Function
+        End If
+        ' Fall through: no usable tokens — match the original term
+    End If
+
     PathContainsClause = "InStr(1, LCase([FilePath]), LCase('" & EscapeAccessString(t) & "'))>0"
 End Function
 

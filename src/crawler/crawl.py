@@ -14,9 +14,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-# Exclusive AccDB target beside the workbook: {workbook_dir}\DB\LAN_Search_Index.accdb
+# Exclusive AccDB beside the workbook: {workbook_dir}\DB\SearchIndex-{M}-{D}-{YYYY}.accdb
+# Snapshot date is the crawl calendar date (local), e.g. SearchIndex-8-13-2026.accdb
 ACCDB_DIR_NAME = "DB"
-ACCDB_FILE_NAME = "LAN_Search_Index.accdb"
+ACCDB_FILE_PREFIX = "SearchIndex"
+ACCDB_FILE_NAME_LEGACY = "LAN_Search_Index.accdb"
+ACCDB_FILE_NAME = ACCDB_FILE_NAME_LEGACY  # kept for import compatibility; dated names are preferred
 ACCDB_ROW_THRESHOLD = 750_000
 
 try:
@@ -368,9 +371,22 @@ def write_csv(rows: list[IndexRow], out_path: Path) -> None:
             w.writerow([r.path, r.file_date, f"{r.size_mb:.2f}", r.entry_type])
 
 
-def accdb_path_for_workbook(workbook: str | Path) -> Path:
-    """Relative AccDB beside the workbook: {wb_dir}\\DB\\LAN_Search_Index.accdb."""
-    return Path(workbook).resolve().parent / ACCDB_DIR_NAME / ACCDB_FILE_NAME
+def accdb_file_name_for_date(snapshot_date: dt.date | None = None) -> str:
+    """AccDB filename for a scrape snapshot, e.g. SearchIndex-8-13-2026.accdb (no zero-padding)."""
+    d = snapshot_date or dt.date.today()
+    return f"{ACCDB_FILE_PREFIX}-{d.month}-{d.day}-{d.year}.accdb"
+
+
+def accdb_path_for_workbook(
+    workbook: str | Path,
+    snapshot_date: dt.date | None = None,
+) -> Path:
+    """Relative AccDB beside the workbook: {wb_dir}\\DB\\SearchIndex-{M}-{D}-{YYYY}.accdb."""
+    return (
+        Path(workbook).resolve().parent
+        / ACCDB_DIR_NAME
+        / accdb_file_name_for_date(snapshot_date)
+    )
 
 
 def _create_empty_accdb(out_path: Path) -> None:

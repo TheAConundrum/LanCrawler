@@ -639,37 +639,19 @@ Private Sub ProtectDashboardSheet()
     UnprotectSheet ws
     On Error Resume Next
 
-    ' Cells.Locked=True on every protect would re-lock merged results and bring
-    ' back Excel's protect dialog on click. Do the lock map once per session.
-    If Not gResultsCopyUnlockDone Then
-        ws.Cells.Locked = True
-        ' Free-text: Contains A3:B3, Contains D3:E3, Size MB G3, File Search A5:F5
-        UnlockMergeOrRange ws, ADDR_TERM1
-        UnlockMergeOrRange ws, ADDR_TERM2
-        UnlockMergeOrRange ws, ADDR_SIZE_MB
-        UnlockMergeOrRange ws, ADDR_FILE_SEARCH
-        ' Dropdowns: Op C3, Size is F3, Flexible H3, Folders I3, Drive H5
-        UnlockMergeOrRange ws, ADDR_OP
-        UnlockMergeOrRange ws, ADDR_SIZE_OP
-        UnlockMergeOrRange ws, ADDR_FLEXIBLE_MATCH
-        UnlockMergeOrRange ws, ADDR_SEARCH_FOLDERS
-        UnlockMergeOrRange ws, ADDR_DRIVE_FILTER
-        ws.Columns(RESULTS_LINK_COL).Locked = False
-        EnsureLinkColumnHidden ws
-        UnlockResultsDataArea ws
-        gResultsCopyUnlockDone = True
-    Else
-        UnlockMergeOrRange ws, ADDR_TERM1
-        UnlockMergeOrRange ws, ADDR_TERM2
-        UnlockMergeOrRange ws, ADDR_SIZE_MB
-        UnlockMergeOrRange ws, ADDR_FILE_SEARCH
-        UnlockMergeOrRange ws, ADDR_OP
-        UnlockMergeOrRange ws, ADDR_SIZE_OP
-        UnlockMergeOrRange ws, ADDR_FLEXIBLE_MATCH
-        UnlockMergeOrRange ws, ADDR_SEARCH_FOLDERS
-        UnlockMergeOrRange ws, ADDR_DRIVE_FILTER
-        EnsureLinkColumnHidden ws
-    End If
+    ' Results table stays unprotected so AutoFilter dropdowns work and users can
+    ' copy/edit; search can be re-run. Criteria still have list validation.
+    UnlockMergeOrRange ws, ADDR_TERM1
+    UnlockMergeOrRange ws, ADDR_TERM2
+    UnlockMergeOrRange ws, ADDR_SIZE_MB
+    UnlockMergeOrRange ws, ADDR_FILE_SEARCH
+    UnlockMergeOrRange ws, ADDR_OP
+    UnlockMergeOrRange ws, ADDR_SIZE_OP
+    UnlockMergeOrRange ws, ADDR_FLEXIBLE_MATCH
+    UnlockMergeOrRange ws, ADDR_SEARCH_FOLDERS
+    UnlockMergeOrRange ws, ADDR_DRIVE_FILTER
+    ws.Columns(RESULTS_LINK_COL).Locked = False
+    EnsureLinkColumnHidden ws
 
     ApplyCriteriaOperatorValidation
     ApplyOptionDropdownValidation
@@ -682,33 +664,8 @@ Private Sub ProtectDashboardSheet()
     ' Filter only if missing — do not tear down/rebuild (corrupts File row merges)
     EnsureResultsAutoFilter ws
 
-    ApplySheetProtect ws, True, True
+    ' Do not Protect the Dashboard — results AutoFilter/copy need an unlocked sheet.
     ws.EnableSelection = xlNoRestrictions
-    On Error GoTo 0
-End Sub
-
-Private Sub UnlockResultsDataArea(ByVal ws As Worksheet)
-    Dim r As Long
-    Dim firstRow As Long
-    Dim lastRow As Long
-
-    If ws Is Nothing Then Exit Sub
-    firstRow = RESULTS_HEADER_ROW + 1
-    lastRow = firstRow + RESULTS_MAX_ROWS - 1
-    On Error Resume Next
-    ' Non-merged Type..Drive can be a block
-    ws.Range(ws.Cells(firstRow, RESULTS_TYPE_COL), ws.Cells(lastRow, RESULTS_DRIVE_COL)).Locked = False
-    ws.Columns(RESULTS_LINK_COL).Locked = False
-    ' Per-row only — a tall A8:A20007 / P8:P20007 unlock collapses the merges
-    For r = firstRow To lastRow
-        ws.Cells(r, RESULTS_FILE_COL).MergeArea.Locked = False
-        ws.Cells(r, RESULTS_FOLDER_COL).MergeArea.Locked = False
-        If r Mod 2000 = 0 Then
-            Application.StatusBar = "LAN Search: enabling results copy " & CStr(r - firstRow + 1) & "/" & CStr(RESULTS_MAX_ROWS)
-            DoEvents
-        End If
-    Next r
-    Application.StatusBar = False
     On Error GoTo 0
 End Sub
 

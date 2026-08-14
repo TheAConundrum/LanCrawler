@@ -297,7 +297,7 @@ Public Function FileNameOnly(ByVal fullPath As String) As String
     End If
 End Function
 
-' Keyword match against a haystack (full path for files, leaf name for folders).
+' Keyword match against a haystack (file or folder leaf name, not ancestor path).
 Public Function TextMatchesCriteria(ByVal text As String, ByVal term1 As String, _
                                    ByVal op As String, ByVal term2 As String, _
                                    ByVal flexible As Boolean, _
@@ -318,24 +318,25 @@ Public Function TextMatchesCriteria(ByVal text As String, ByVal term1 As String,
     op = UCase$(Trim$(op))
     hasTerm2 = (Len(t2) > 0 And Len(op) > 0)
 
-    If Len(t1) = 0 Then
-        TextMatchesCriteria = False
-        Exit Function
-    End If
-
     If flexible Then
         hay = NormalizeForMatch(text)
-        t1 = NormalizeForMatch(t1)
+        If Len(t1) > 0 Then t1 = NormalizeForMatch(t1)
         If hasTerm2 Then t2 = NormalizeForMatch(t2)
         If Len(extra) > 0 Then extra = NormalizeForMatch(extra)
-        If Len(t1) = 0 Then
-            TextMatchesCriteria = False
-            Exit Function
-        End If
         cmp = vbBinaryCompare
     Else
         hay = text
         cmp = vbTextCompare
+    End If
+
+    If Len(t1) = 0 Then
+        ' Contains NOT <term2> with File Search as the leaf term (no first Contains box)
+        If hasTerm2 And op = "NOT" And Len(t2) > 0 Then
+            TextMatchesCriteria = (InStr(1, hay, t2, cmp) = 0)
+        Else
+            TextMatchesCriteria = False
+        End If
+        Exit Function
     End If
 
     has1 = (InStr(1, hay, t1, cmp) > 0)
@@ -358,13 +359,99 @@ Public Function TextMatchesCriteria(ByVal text As String, ByVal term1 As String,
     TextMatchesCriteria = matched
 End Function
 
+' Folder / file rows match the leaf name only — not ancestor names in the path.
+Public Function LeafMatchesCriteria(ByVal fullPath As String, ByVal term1 As String, _
+                                   ByVal op As String, ByVal term2 As String, _
+                                   ByVal flexible As Boolean, _
+                                   Optional ByVal extraAndTerm As String = "") As Boolean
+    LeafMatchesCriteria = TextMatchesCriteria(FileNameOnly(fullPath), term1, op, term2, _
+                                              flexible, extraAndTerm)
+End Function
+
 ' Folder rows match the folder's own name only — not ancestor names in the path.
 Public Function FolderLeafMatchesCriteria(ByVal folderPath As String, ByVal term1 As String, _
                                          ByVal op As String, ByVal term2 As String, _
                                          ByVal flexible As Boolean, _
                                          Optional ByVal extraAndTerm As String = "") As Boolean
-    FolderLeafMatchesCriteria = TextMatchesCriteria(FileNameOnly(folderPath), term1, op, term2, _
+    FolderLeafMatchesCriteria = LeafMatchesCriteria(folderPath, term1, op, term2, _
                                                     flexible, extraAndTerm)
+End Function
+
+' File Search matches the leaf name. Optional Contains row refines against the full path
+' so "pdf" + NOT "working" can keep PDFs and drop hits under a Working Files folder.
+Public Function SearchHitMatches(ByVal fullPath As String, _
+                                 ByVal leafTerm As String, _
+                                 ByVal term1 As String, ByVal op As String, ByVal term2 As String, _
+                                 ByVal flexible As Boolean, _
+                                 ByVal applyPathRefine As Boolean) As Boolean
+    Dim leaf As String
+    leaf = FileNameOnly(fullPath)
+    If applyPathRefine Then
+        If Not TextMatchesCriteria(leaf, leafTerm, vbNullString, vbNullString, flexible) Then
+            SearchHitMatches = False
+            Exit Function
+        End If
+        SearchHitMatches = TextMatchesCriteria(fullPath, term1, op, term2, flexible)
+    Else
+        SearchHitMatches = TextMatchesCriteria(leaf, term1, op, term2, flexible)
+    End If
+End Function
+
+' Split a search term into alphanumeric chunks using the same separators as NormalizeForMatch.
+' Used as a loose AccDB SQL prefilter; VBA LeafMatchesCriteria is authoritative.
+Public Function SplitFlexibleTokens(ByVal term As String) As Variant
+    Dim src As String
+    Dim i As Long
+    Dim n As Long
+    Dim ch As Long
+    Dim buf As String
+    Dim outLen As Long
+    Dim tokens() As String
+    Dim count As Long
+
+    src = LCase$(Trim$(term))
+    n = Len(src)
+    If n = 0 Then
+        SplitFlexibleTokens = Array()
+        Exit Function
+    End If
+
+    ReDim tokens(1 To n)
+    count = 0
+    buf = vbNullString
+    outLen = 0
+
+    For i = 1 To n
+        ch = AscW(Mid$(src, i, 1))
+        Select Case ch
+            Case 32, 33, 35, 36, 37, 38, 39, 40, 41, 43, 44, 45, 46, 59, _
+                 61, 64, 91, 93, 94, 95, 96, 123, 124, 125, 126
+                If outLen >= 2 Then
+                    count = count + 1
+                    tokens(count) = Left$(buf, outLen)
+                End If
+                buf = vbNullString
+                outLen = 0
+            Case Else
+                outLen = outLen + 1
+                If outLen = 1 Then
+                    buf = ChrW$(ch)
+                Else
+                    buf = buf & ChrW$(ch)
+                End If
+        End Select
+    Next i
+    If outLen >= 2 Then
+        count = count + 1
+        tokens(count) = Left$(buf, outLen)
+    End If
+
+    If count = 0 Then
+        SplitFlexibleTokens = Array()
+    Else
+        ReDim Preserve tokens(1 To count)
+        SplitFlexibleTokens = tokens
+    End If
 End Function
 
 ' Flexible match: lowercase and strip punctuation separators; keep \ and /.
@@ -388,7 +475,6 @@ Public Function NormalizeForMatch(ByVal text As String) As String
     outLen = 0
     For i = 1 To n
         ch = AscW(Mid$(src, i, 1))
-        ' Must stay in sync with SEPARATORS_TO_STRIP
         Select Case ch
             Case 32, 33, 35, 36, 37, 38, 39, 40, 41, 43, 44, 45, 46, 59, _
                  61, 64, 91, 93, 94, 95, 96, 123, 124, 125, 126

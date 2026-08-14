@@ -3,7 +3,7 @@ CLI: parallel LAN crawler for LAN Search Tool.
 
 Examples:
   python -m crawler "O:\\Some Folder" --workers 16
-  python -m crawler "\\\\server\\share\\folder" -o out\\index.csv --accdb out\\DB\\LAN_Search_Index.accdb
+  python -m crawler "\\\\server\\share\\folder" -o out\\index.csv --accdb out\\DB\\SearchIndex-8-13-2026.accdb
   python -m crawler "O:\\folder" --import-excel "..\\AccDB-Blank_LAN_Crawler Tool.xlsm" --mode ReplaceRoot
 """
 from __future__ import annotations

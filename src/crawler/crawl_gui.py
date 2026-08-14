@@ -104,7 +104,7 @@ def run_crawl_gui(
     mode_frm.grid(row=5, column=0, columnspan=2, sticky="w", padx=padx, pady=pady)
     ttk.Radiobutton(
         mode_frm,
-        text="AccDB (DB\\LAN_Search_Index.accdb beside workbook) — default",
+        text="AccDB (DB\\SearchIndex-M-D-YYYY.accdb beside workbook) — default",
         variable=mode_var,
         value="AccDB",
     ).pack(anchor="w")

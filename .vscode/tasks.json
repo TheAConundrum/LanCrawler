@@ -23,13 +23,17 @@
         },
         {
             "label": "Crawl LAN folder (picker)",
-            "type": "process",
+            "type": "shell",
             "command": "${command:python.interpreterPath}",
             "args": [
                 "${workspaceFolder}\\src\\crawler\\run_crawl.py"
             ],
             "options": {
-                "cwd": "${workspaceFolder}\\src"
+                "cwd": "${workspaceFolder}",
+                "shell": {
+                    "executable": "cmd.exe",
+                    "args": ["/d", "/c"]
+                }
             },
             "problemMatcher": [],
             "presentation": {
@@ -44,13 +48,17 @@
         },
         {
             "label": "SummitLANScan (all network drives)",
-            "type": "process",
+            "type": "shell",
             "command": "${command:python.interpreterPath}",
             "args": [
                 "${workspaceFolder}\\src\\crawler\\summit_lan_scan.py"
             ],
             "options": {
-                "cwd": "${workspaceFolder}\\src"
+                "cwd": "${workspaceFolder}",
+                "shell": {
+                    "executable": "cmd.exe",
+                    "args": ["/d", "/c"]
+                }
             },
             "problemMatcher": [],
             "presentation": {
@@ -65,14 +73,18 @@
         },
         {
             "label": "Unlock workbook for layout edit",
-            "type": "process",
+            "type": "shell",
             "command": "${command:python.interpreterPath}",
             "args": [
                 "${workspaceFolder}\\src\\unlock_workbook.py",
                 "${workspaceFolder}\\AccDB-Blank_LAN_Crawler Tool.xlsm"
             ],
             "options": {
-                "cwd": "${workspaceFolder}"
+                "cwd": "${workspaceFolder}",
+                "shell": {
+                    "executable": "cmd.exe",
+                    "args": ["/d", "/c"]
+                }
             },
             "problemMatcher": [],
             "presentation": {
@@ -87,14 +99,18 @@
         },
         {
             "label": "1. Run Python Inject",
-            "type": "process",
+            "type": "shell",
             "command": "${command:python.interpreterPath}",
             "args": [
                 "${workspaceFolder}\\src\\inject_vba.py",
                 "${workspaceFolder}\\AccDB-Blank_LAN_Crawler Tool.xlsm"
             ],
             "options": {
-                "cwd": "${workspaceFolder}"
+                "cwd": "${workspaceFolder}",
+                "shell": {
+                    "executable": "cmd.exe",
+                    "args": ["/d", "/c"]
+                }
             },
             "problemMatcher": [],
             "presentation": {
