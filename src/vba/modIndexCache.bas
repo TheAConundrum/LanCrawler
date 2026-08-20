@@ -3,8 +3,9 @@ Option Explicit
 Option Private Module
 
 ' Exclusive session index backend:
-'   AccDB  — {workbook}\DB\SearchIndex-{M}-{D}-{YYYY}.accdb (newest dated snapshot;
-'            falls back to LAN_Search_Index.accdb if no dated file exists)
+'   AccDB  — newest {workbook}\DB\SearchIndex-{M}-{D}-{YYYY}.accdb (filename is snapshot
+'            birth date; later crawls merge into that file). Falls back to
+'            LAN_Search_Index.accdb. If none exist, crawler creates SearchIndex-{today}.
 '   Sheet  — no AccDB and onboard Database!tblFiles is non-empty
 '   Empty  — neither available
 ' No hybrid merge. Resolve once on warm / EnsureResolved.
@@ -254,7 +255,7 @@ Public Sub ResolveIndexBackend(Optional ByVal wb As Workbook = Nothing)
     InvalidateIndex
     mWorkbookPath = wb.FullName
 
-    ' AccDB wins when present (sheet leftovers must not shadow AccDB-Blank crawls)
+    ' AccDB wins when present (sheet leftovers must not shadow AccDB crawls)
     If AccdbExists(wb) Then
         mBackend = BACKEND_ACCDB
         mAccdbResolvedPath = AccdbPath(wb)

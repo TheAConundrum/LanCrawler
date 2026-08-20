@@ -1,5 +1,5 @@
 """
-Unlock AccDB-Blank (or another .xlsm) for Dashboard layout editing.
+Unlock Lan_Search_Tool.xlsm (or another .xlsm) for Dashboard layout editing.
 
 Unprotects sheets, unlocks ALL cells, sets layout-edit mode so WarmIndexCache
 will not re-lock, leaves Excel open.
@@ -20,7 +20,7 @@ if str(_SRC) not in sys.path:
 from workbook_security import _unprotect_sheet_api  # noqa: E402
 
 XL_SHEET_VISIBLE = -1
-DEFAULT_WB = Path(__file__).resolve().parent.parent / "AccDB-Blank_LAN_Crawler Tool.xlsm"
+DEFAULT_WB = Path(__file__).resolve().parent.parent / "Lan_Search_Tool.xlsm"
 
 
 def _com_unlock_all(wb: Any) -> None:
@@ -132,7 +132,7 @@ def main(argv: list[str] | None = None) -> int:
         "workbook",
         nargs="?",
         default=str(DEFAULT_WB),
-        help="Path to .xlsm (default: AccDB-Blank_LAN_Crawler Tool.xlsm)",
+        help="Path to .xlsm (default: Lan_Search_Tool.xlsm)",
     )
     args = parser.parse_args(argv)
     try:

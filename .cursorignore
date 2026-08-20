@@ -4,7 +4,7 @@
 *.xls
 *.xlsb
 !Blank_LAN_Crawler Tool.xlsm
-!AccDB-Blank_LAN_Crawler Tool.xlsm
+!Lan_Search_Tool.xlsm
 LAN Search Tool.xlsm
 **/LAN Search Tool.xlsm
 
@@ -29,3 +29,6 @@ credentials.json
 **/secrets/
 
 agent-transcripts/
+
+.portable_venv/
+vendor/wheels/

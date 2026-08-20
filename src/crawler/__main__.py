@@ -2,14 +2,15 @@
 CLI: parallel LAN crawler for LAN Search Tool.
 
 Examples:
-  python -m crawler "O:\\Some Folder" --workers 16
-  python -m crawler "\\\\server\\share\\folder" -o out\\index.csv --accdb out\\DB\\SearchIndex-8-13-2026.accdb
-  python -m crawler "O:\\folder" --import-excel "..\\AccDB-Blank_LAN_Crawler Tool.xlsm" --mode ReplaceRoot
+  python -m crawler "O:\\Some Folder" --workers 16 --accdb out\\DB\\SearchIndex-8-13-2026.accdb
+  python -m crawler "\\\\server\\share\\folder" -o out\\index.csv
+  python -m crawler "O:\\folder" --import-excel "..\\Lan_Search_Tool.xlsm" --target AccDB
 """
 from __future__ import annotations
 
 import argparse
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -22,19 +23,16 @@ from crawler.crawl import (  # noqa: E402
     ACCDB_ROW_THRESHOLD,
     accdb_path_for_workbook,
     crawl_parallel,
+    purge_workbook_accdbs,
     write_accdb,
     write_csv,
 )
 from crawler.paths import build_drive_map, bytes_to_size_mb, to_unc_path  # noqa: E402
 
 
-def _default_out_dir() -> Path:
-    return Path(__file__).resolve().parent.parent.parent / "crawl_output"
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Parallel LAN crawler for LAN Search Tool (CSV / AccDB / Excel)."
+        description="Parallel LAN crawler for LAN Search Tool (AccDB / Excel; optional CSV)."
     )
     parser.add_argument("root", help="Folder to crawl (mapped drive or UNC)")
     parser.add_argument(
@@ -42,7 +40,7 @@ def main(argv: list[str] | None = None) -> int:
         "--output",
         type=Path,
         default=None,
-        help="CSV output path (default: crawl_output/<timestamp>_tblFiles.csv)",
+        help="Optional CSV output path (not written unless this flag is set)",
     )
     parser.add_argument(
         "--accdb",
@@ -72,7 +70,7 @@ def main(argv: list[str] | None = None) -> int:
         "--import-excel",
         type=Path,
         default=None,
-        help="After crawl, import CSV into this .xlsm (requires xlwings)",
+        help="After crawl, import into this .xlsm (requires xlwings)",
     )
     parser.add_argument(
         "--mode",
@@ -89,16 +87,20 @@ def main(argv: list[str] | None = None) -> int:
             f"Auto uses AccDB above {ACCDB_ROW_THRESHOLD:,} rows"
         ),
     )
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help="Delete existing workbook DB\\ AccDB files and write a new snapshot",
+    )
     args = parser.parse_args(argv)
 
-    out_dir = _default_out_dir()
-    stamp = time.strftime("%Y%m%d_%H%M%S")
-    csv_path = args.output or (out_dir / f"{stamp}_tblFiles.csv")
+    csv_path = args.output
     accdb_path = args.accdb
 
     print(f"Root:     {args.root}")
     print(f"Workers:  {args.workers}")
-    print(f"CSV out:  {csv_path}")
+    if csv_path:
+        print(f"CSV out:  {csv_path}")
     if accdb_path:
         print(f"AccDB:    {accdb_path}")
 
@@ -121,8 +123,9 @@ def main(argv: list[str] | None = None) -> int:
         on_progress=on_progress,
     )
 
-    write_csv(rows, csv_path)
-    print(f"Wrote CSV {csv_path} ({len(rows):,} rows) in {time.time() - t0:.1f}s")
+    if csv_path is not None:
+        write_csv(rows, csv_path)
+        print(f"Wrote CSV {csv_path} ({len(rows):,} rows) in {time.time() - t0:.1f}s")
 
     print(
         f"Stats: files={stats.files_indexed:,} folders={stats.folders_indexed:,} "
@@ -153,6 +156,19 @@ def main(argv: list[str] | None = None) -> int:
     elif target == "Auto" and len(rows) <= ACCDB_ROW_THRESHOLD:
         use_accdb = False
 
+    if args.fresh:
+        if args.import_excel is not None:
+            print(f"Starting fresh: deleting AccDB files beside {args.import_excel} ...")
+            purge_workbook_accdbs(args.import_excel)
+        if args.accdb is not None and Path(args.accdb).exists():
+            print(f"Starting fresh: deleting {args.accdb} ...")
+            try:
+                Path(args.accdb).unlink()
+            except OSError as exc:
+                raise SystemExit(f"Could not delete AccDB (close Excel and retry): {exc}") from exc
+        if use_accdb and args.accdb is None and args.import_excel is not None:
+            accdb_path = accdb_path_for_workbook(args.import_excel)
+
     if use_accdb:
         if accdb_path is None:
             raise SystemExit("AccDB path required (--accdb or --import-excel for relative DB path)")
@@ -169,12 +185,34 @@ def main(argv: list[str] | None = None) -> int:
         from crawler.import_to_excel import import_csv_to_workbook
 
         print(f"Importing into {args.import_excel} mode={args.mode} ...")
-        import_csv_to_workbook(
-            workbook=args.import_excel,
-            csv_path=csv_path,
-            mode=args.mode,
-            unc_root=unc,
-        )
+        if csv_path is not None:
+            import_csv_to_workbook(
+                workbook=args.import_excel,
+                csv_path=csv_path,
+                mode=args.mode,
+                unc_root=unc,
+            )
+        else:
+            tmp = tempfile.NamedTemporaryFile(
+                prefix="lan_search_",
+                suffix=".csv",
+                delete=False,
+            )
+            tmp_csv = Path(tmp.name)
+            tmp.close()
+            try:
+                write_csv(rows, tmp_csv)
+                import_csv_to_workbook(
+                    workbook=args.import_excel,
+                    csv_path=tmp_csv,
+                    mode=args.mode,
+                    unc_root=unc,
+                )
+            finally:
+                try:
+                    tmp_csv.unlink()
+                except OSError:
+                    pass
         print("Excel import complete.")
 
     return 0

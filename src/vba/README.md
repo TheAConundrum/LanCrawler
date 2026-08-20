@@ -5,7 +5,7 @@
 1. Trust access to the VBA project object model enabled in Excel  
    (File → Options → Trust Center → Trust Center Settings → Macro Settings)
 2. Run task **Import VBA code to Excel**  
-   - Closes `AccDB-Blank_LAN_Crawler Tool.xlsm` if open  
+   - Closes `Lan_Search_Tool.xlsm` if open  
    - Injects everything from `src/vba/`  
    - Removes old `Module1`–`Module4` if present  
    - Leaves Excel open with the updated workbook  
@@ -15,10 +15,10 @@
 Or from a terminal:
 
 ```text
-python src\inject_vba.py "AccDB-Blank_LAN_Crawler Tool.xlsm"
+python src\inject_vba.py "Lan_Search_Tool.xlsm"
 ```
 
-Keep `Blank_LAN_Crawler Tool.xlsm` as the stable non-AccDB template. AccDB work uses `AccDB-Blank_LAN_Crawler Tool.xlsm`.
+Keep `Blank_LAN_Crawler Tool.xlsm` as the stable non-AccDB template. AccDB work uses `Lan_Search_Tool.xlsm`.
 
 Manual import below is only a fallback.
 
@@ -61,7 +61,7 @@ If you still see `ListFiles` / `GetSearchResults` / many other names, **delete t
 On open / warm, `modIndexCache.ResolveIndexBackend` picks **one** backend for the session:
 
 1. If onboard `Database!tblFiles` is non-empty → **Sheet**
-2. Else if `{workbook}\DB\LAN_Search_Index.accdb` exists → **AccDB** (late-bound ADODB / ACE)
+2. Else if newest `{workbook}\DB\SearchIndex-M-D-YYYY.accdb` exists (else `LAN_Search_Index.accdb`) → **AccDB** (late-bound ADODB / ACE)
 3. Else → empty (search prompts to crawl)
 
 AccDB crawls clear onboard `tblFiles` so leftover sheet rows cannot shadow AccDB. Search does not merge backends.
@@ -112,11 +112,11 @@ Results: **A:K** File (blue; **double-click** opens folder) | **L** File Type | 
 
 ### AccDB (beside workbook)
 
-- Path: `{workbook folder}\DB\LAN_Search_Index.accdb`
+- Path: newest `{workbook folder}\DB\SearchIndex-M-D-YYYY.accdb` (filename is snapshot birth date; crawls merge into that file). Else `LAN_Search_Index.accdb`. If none exist, the crawler creates `SearchIndex-{today}.accdb`.
 - `tblFiles`: same schema as sheet; indexes on `FilePath` and `EntryType`
 - `tblIngested`: one row per crawl root (RootPath | DateIngested | FileCount | FolderCount | TotalSizeMB); accumulates across AccDB ReplaceRoot crawls
 - On AccDB resolve / cache warm, VBA replaces **Ingestion!tblIngested** + **E2:E5** with AccDB’s scan list only
-- If AccDB is deleted, next warm/search clears Ingestion history
+- If AccDB is deleted, next warm/search clears Ingestion history; next crawl creates a fresh dated snapshot
 - Requires ACE on each PC that searches AccDB
 
 ## Index filter (docs + images + parent archives)
@@ -136,7 +136,7 @@ See [`src/crawler/README.md`](../crawler/README.md). Example:
 
 ```bat
 cd /d "D:\path\to\LAN Search Tool\src"
-python -m crawler "O:\Some Folder" -w 16 --import-excel "..\AccDB-Blank_LAN_Crawler Tool.xlsm" --target Auto
+python -m crawler "O:\Some Folder" -w 16 --import-excel "..\Lan_Search_Tool.xlsm" --target AccDB
 ```
 
 ## Search behavior

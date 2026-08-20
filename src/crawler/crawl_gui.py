@@ -1,5 +1,4 @@
-"""Small crawl GUI: pick folder, workbook, and Auto/Workbook/AccDB target mode."""
-
+"""Small crawl GUI: pick folder (workbook defaults to Lan_Search_Tool.xlsm)."""
 from __future__ import annotations
 
 import tkinter as tk
@@ -7,12 +6,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+DEFAULT_WORKBOOK_NAME = "Lan_Search_Tool.xlsm"
+
 
 @dataclass
 class CrawlGuiResult:
     root: str
     workbook: str
     target_mode: str  # Auto | Workbook | AccDB
+    accdb_fresh: bool = False
     cancelled: bool = False
 
 
@@ -21,7 +23,51 @@ def _project_root() -> Path:
 
 
 def _default_workbook() -> Path:
-    return _project_root() / "AccDB-Blank_LAN_Crawler Tool.xlsm"
+    return _project_root() / DEFAULT_WORKBOOK_NAME
+
+
+def ask_accdb_merge_or_fresh(*, taken_on: str) -> str:
+    """Ask whether to merge into the existing AccDB or start fresh. Returns add|fresh|cancel."""
+    win = tk.Tk()
+    win.title("Existing index found")
+    win.resizable(False, False)
+    try:
+        win.attributes("-topmost", True)
+        win.lift()
+        win.focus_force()
+    except tk.TclError:
+        pass
+
+    choice = {"value": "cancel"}
+
+    def pick(value: str) -> None:
+        choice["value"] = value
+        win.destroy()
+
+    frm = ttk.Frame(win, padding=16)
+    frm.grid(row=0, column=0, sticky="nsew")
+    ttk.Label(
+        frm,
+        text=(
+            f"Do you want to add to the DB taken on {taken_on},\n"
+            "or delete it and start fresh?"
+        ),
+        wraplength=420,
+        justify="left",
+    ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 12))
+
+    ttk.Button(frm, text="Add to existing", command=lambda: pick("add")).grid(
+        row=1, column=0, padx=4, pady=4, sticky="ew"
+    )
+    ttk.Button(frm, text="Start fresh", command=lambda: pick("fresh")).grid(
+        row=1, column=1, padx=4, pady=4, sticky="ew"
+    )
+    ttk.Button(frm, text="Cancel", command=lambda: pick("cancel")).grid(
+        row=1, column=2, padx=4, pady=4, sticky="ew"
+    )
+    win.protocol("WM_DELETE_WINDOW", lambda: pick("cancel"))
+    win.mainloop()
+    return choice["value"]
 
 
 def run_crawl_gui(
@@ -42,8 +88,8 @@ def run_crawl_gui(
     folder_var = tk.StringVar(value="")
     wb_default = Path(initial_workbook) if initial_workbook else _default_workbook()
     workbook_var = tk.StringVar(value=str(wb_default) if wb_default.is_file() else "")
-    mode_var = tk.StringVar(value="AccDB")
     result: dict[str, CrawlGuiResult | None] = {"value": None}
+    show_workbook = not wb_default.is_file()
 
     def browse_folder() -> None:
         path = filedialog.askdirectory(title="Select folder / drive to crawl", mustexist=True)
@@ -67,23 +113,29 @@ def run_crawl_gui(
     def on_start() -> None:
         folder = folder_var.get().strip()
         workbook = workbook_var.get().strip()
-        mode = mode_var.get().strip() or "AccDB"
         if not folder:
             messagebox.showwarning("Missing folder", "Select a folder or drive to crawl.")
             return
         if not workbook:
-            messagebox.showwarning("Missing workbook", "Select the target .xlsm workbook.")
+            messagebox.showwarning("Missing workbook", "Lan_Search_Tool.xlsm was not found.")
             return
         if not Path(workbook).is_file():
             messagebox.showerror("Workbook not found", f"File not found:\n{workbook}")
             return
-        if mode not in ("Auto", "Workbook", "AccDB"):
-            mode = "AccDB"
-        result["value"] = CrawlGuiResult(root=folder, workbook=workbook, target_mode=mode)
+        result["value"] = CrawlGuiResult(
+            root=folder,
+            workbook=workbook,
+            target_mode="AccDB",
+        )
         root_win.destroy()
 
     def on_cancel() -> None:
-        result["value"] = CrawlGuiResult(root="", workbook="", target_mode="AccDB", cancelled=True)
+        result["value"] = CrawlGuiResult(
+            root="",
+            workbook="",
+            target_mode="AccDB",
+            cancelled=True,
+        )
         root_win.destroy()
 
     padx = 10
@@ -91,35 +143,36 @@ def run_crawl_gui(
     frm = ttk.Frame(root_win, padding=12)
     frm.grid(row=0, column=0, sticky="nsew")
 
-    ttk.Label(frm, text="Folder / drive to crawl").grid(row=0, column=0, sticky="w", padx=padx, pady=pady)
-    ttk.Entry(frm, textvariable=folder_var, width=64).grid(row=1, column=0, sticky="ew", padx=padx, pady=pady)
-    ttk.Button(frm, text="Browse…", command=browse_folder).grid(row=1, column=1, padx=padx, pady=pady)
-
-    ttk.Label(frm, text="Target workbook (.xlsm)").grid(row=2, column=0, sticky="w", padx=padx, pady=pady)
-    ttk.Entry(frm, textvariable=workbook_var, width=64).grid(row=3, column=0, sticky="ew", padx=padx, pady=pady)
-    ttk.Button(frm, text="Browse…", command=browse_workbook).grid(row=3, column=1, padx=padx, pady=pady)
-
-    ttk.Label(frm, text="Index target").grid(row=4, column=0, sticky="w", padx=padx, pady=pady)
-    mode_frm = ttk.Frame(frm)
-    mode_frm.grid(row=5, column=0, columnspan=2, sticky="w", padx=padx, pady=pady)
-    ttk.Radiobutton(
-        mode_frm,
-        text="AccDB (DB\\SearchIndex-M-D-YYYY.accdb beside workbook) — default",
-        variable=mode_var,
-        value="AccDB",
-    ).pack(anchor="w")
-    ttk.Radiobutton(mode_frm, text="Auto (sheet under 750k; AccDB if larger)", variable=mode_var, value="Auto").pack(
-        anchor="w"
+    ttk.Label(frm, text="Folder / drive to crawl").grid(
+        row=0, column=0, sticky="w", padx=padx, pady=pady
     )
-    ttk.Radiobutton(
-        mode_frm,
-        text="Workbook (Database!tblFiles) — forced to AccDB above 750k",
-        variable=mode_var,
-        value="Workbook",
-    ).pack(anchor="w")
+    ttk.Entry(frm, textvariable=folder_var, width=64).grid(
+        row=1, column=0, sticky="ew", padx=padx, pady=pady
+    )
+    ttk.Button(frm, text="Browse…", command=browse_folder).grid(
+        row=1, column=1, padx=padx, pady=pady
+    )
+
+    row = 2
+    if show_workbook:
+        ttk.Label(frm, text="Target workbook (.xlsm)").grid(
+            row=row, column=0, sticky="w", padx=padx, pady=pady
+        )
+        ttk.Entry(frm, textvariable=workbook_var, width=64).grid(
+            row=row + 1, column=0, sticky="ew", padx=padx, pady=pady
+        )
+        ttk.Button(frm, text="Browse…", command=browse_workbook).grid(
+            row=row + 1, column=1, padx=padx, pady=pady
+        )
+        row = row + 2
+    else:
+        ttk.Label(frm, text=f"Workbook: {wb_default.name}").grid(
+            row=row, column=0, columnspan=2, sticky="w", padx=padx, pady=pady
+        )
+        row = row + 1
 
     btn_frm = ttk.Frame(frm)
-    btn_frm.grid(row=6, column=0, columnspan=2, sticky="e", padx=padx, pady=pady)
+    btn_frm.grid(row=row, column=0, columnspan=2, sticky="e", padx=padx, pady=pady)
     ttk.Button(btn_frm, text="Cancel", command=on_cancel).pack(side="right", padx=4)
     ttk.Button(btn_frm, text="Start crawl", command=on_start).pack(side="right", padx=4)
 

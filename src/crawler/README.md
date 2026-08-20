@@ -16,18 +16,15 @@ LAN crawls are dominated by waiting on directory listings. Multiple workers over
 ## Quick start (easiest in Cursor)
 
 **Run Task:** `Crawl LAN folder (picker)`  
-or right-click / Run: `src/crawler/run_crawl.py`
+or `run_crawl.cmd` / `src/crawler/run_crawl.py`
 
-A small GUI asks for:
+A small GUI asks for the folder / drive to crawl (workbook defaults to `Lan_Search_Tool.xlsm`). If an AccDB already exists:
 
-1. Folder / drive to crawl  
-2. Target workbook (defaults to `AccDB-Blank_LAN_Crawler Tool.xlsm`)  
-3. Index target: **Auto** | **Workbook** | **AccDB**
+> Do you want to add to the DB taken on *date*, or delete it and start fresh?
 
-**Auto / Workbook** under **750,000** rows → import into `Database!tblFiles`.  
-**AccDB**, or any mode above **750,000** rows → write `{workbook}\DB\LAN_Search_Index.accdb` (`tblFiles` + `tblIngested`). Each AccDB crawl **ReplaceRoot**-merges that folder into the AccDB (keeps other roots’ files and scan history). On workbook open / cache warm (and when AccDB is deleted), VBA restores **Ingestion!tblIngested** from AccDB only — or clears it if the AccDB file is gone. CSV still goes to `crawl_output\`.
+**Add** ReplaceRoot-merges that folder into the same AccDB (keeps other roots + `tblIngested`). **Start fresh** deletes `DB\SearchIndex-*.accdb` and `LAN_Search_Index.accdb`, then creates `SearchIndex-{today}.accdb`. If the AccDB is already gone, no prompt — a new dated file is created. AccDB crawls write the index in memory → AccDB only (no `crawl_output` CSV).
 
-Keep `Blank_LAN_Crawler Tool.xlsm` as the stable non-AccDB template; AccDB development uses `AccDB-Blank_LAN_Crawler Tool.xlsm`.
+Keep `Blank_LAN_Crawler Tool.xlsm` as the stable non-AccDB template; AccDB work uses `Lan_Search_Tool.xlsm`.
 
 UNC also works:
 
@@ -40,17 +37,30 @@ python -m crawler "\\fileserver\share$\Some Folder" -w 24
 | Flag | Meaning |
 |------|---------|
 | `-w` / `--workers` | Parallel folder workers (default **16**; try 8–32) |
-| `-o path.csv` | CSV output path |
+| `-o path.csv` | Optional CSV dump (not written unless this flag is set) |
 | `--accdb path.accdb` | Write AccDB `tblFiles` |
 | `--target Auto\|Workbook\|AccDB` | Exclusive index mode with `--import-excel` |
+| `--fresh` | Delete existing AccDB files, then write a new snapshot (CLI; no GUI prompt) |
 | `--unc-root \\server\share` | Override if mapped-drive → UNC fails |
-| `--import-excel "..\AccDB-Blank_LAN_Crawler Tool.xlsm"` | Workbook for sheet import or AccDB relative `\DB\` path |
+| `--import-excel "..\Lan_Search_Tool.xlsm"` | Workbook for sheet import or AccDB relative `\DB\` path |
 
 ### Crawl + AccDB / Excel
 
 ```bat
-python -m crawler "O:\Some Folder" -w 16 --import-excel "..\AccDB-Blank_LAN_Crawler Tool.xlsm" --target Auto
+python -m crawler "O:\Some Folder" -w 16 --import-excel "..\Lan_Search_Tool.xlsm" --target AccDB
 ```
+
+### Portable zip
+
+On a machine that can `pip download` (JFrog):
+
+```bat
+pack_portable.cmd
+```
+
+Creates `dist/Lan_Search_Tool.zip`. Colleague unzips, double-clicks `run_crawl.cmd`. Packages install **offline** from `vendor/wheels` into `.portable_venv` (no PyPI). After the crawl they can delete that venv.
+
+The packer downloads wheels for Python **3.10–3.14** (32-bit and 64-bit Windows). If install fails, the cmd window prints this PC’s Python vs the packed `cp###` wheel names.
 
 ## Output columns (same as VBA `tblFiles`)
 
@@ -75,11 +85,13 @@ python -m crawler "O:\Some Folder" -w 16 --import-excel "..\AccDB-Blank_LAN_Craw
 src/crawler/
   __main__.py         CLI
   crawl.py            Thread-pool crawler + write_accdb
-  crawl_gui.py        Small target GUI
+  crawl_gui.py        Folder GUI + AccDB add/fresh dialog
   filters.py          Allowlist / junk / split volumes
   paths.py            UNC resolve, size helpers
   import_to_excel.py  Sheet import + clear_onboard_tblfiles
   run_crawl.py        Launcher
+
+src/pack_portable.py  Zip colleague kit (pack_portable.cmd)
 ```
 
 ## Tips

@@ -18,8 +18,8 @@ if str(_SRC) not in sys.path:
 from crawler.crawl import (  # noqa: E402
     accdb_path_for_workbook,
     crawl_parallel,
+    purge_workbook_accdbs,
     write_accdb,
-    write_csv,
 )
 from crawler.paths import (  # noqa: E402
     build_drive_map,
@@ -29,11 +29,7 @@ from crawler.paths import (  # noqa: E402
 )
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-_DEFAULT_WORKBOOK = _PROJECT_ROOT / "AccDB-Blank_LAN_Crawler Tool.xlsm"
-
-
-def _default_out_dir() -> Path:
-    return _PROJECT_ROOT / "crawl_output"
+_DEFAULT_WORKBOOK = _PROJECT_ROOT / "Lan_Search_Tool.xlsm"
 
 
 def run_summit_lan_scan(
@@ -41,6 +37,7 @@ def run_summit_lan_scan(
     workers: int = 16,
     workbook: str | Path | None = None,
     progress_every: int = 50,
+    accdb_fresh: bool = False,
 ) -> int:
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
@@ -60,9 +57,15 @@ def run_summit_lan_scan(
         print("No reachable mapped network drives found on this PC.", flush=True)
         return 1
 
+    if accdb_fresh:
+        print("Starting fresh: deleting existing AccDB files in DB\\ ...", flush=True)
+        try:
+            purge_workbook_accdbs(wb_path)
+        except RuntimeError as exc:
+            print(str(exc), flush=True)
+            return 1
+
     accdb_out = accdb_path_for_workbook(wb_path)
-    out_dir = _default_out_dir()
-    stamp = time.strftime("%Y%m%d_%H%M%S")
 
     print(f"Workbook: {wb_path}", flush=True)
     print(f"AccDB:    {accdb_out}", flush=True)
@@ -99,10 +102,8 @@ def run_summit_lan_scan(
             failed.append(letter)
             continue
 
-        csv_path = out_dir / f"{stamp}_{letter[0]}_tblFiles.csv"
-        write_csv(rows, csv_path)
         print(
-            f"  CSV {csv_path.name}: {len(rows):,} rows  "
+            f"  Crawl {letter}: {len(rows):,} rows  "
             f"files={stats.files_indexed:,} folders={stats.folders_indexed:,} "
             f"errors={stats.errors:,} disk~{bytes_to_size_mb(stats.bytes_all_files):,.2f} MB "
             f"in {time.time() - t0:.1f}s",
@@ -144,7 +145,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--workbook",
         default=None,
-        help="Target .xlsm (default: AccDB-Blank_LAN_Crawler Tool.xlsm next to this project)",
+        help="Target .xlsm (default: Lan_Search_Tool.xlsm next to this project)",
+    )
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help="Delete existing AccDB files and write a new snapshot",
     )
     parser.add_argument(
         "-w",
@@ -154,7 +160,9 @@ def main(argv: list[str] | None = None) -> int:
         help="Parallel folder workers per drive (default 16)",
     )
     args = parser.parse_args(argv)
-    return run_summit_lan_scan(workers=args.workers, workbook=args.workbook)
+    return run_summit_lan_scan(
+        workers=args.workers, workbook=args.workbook, accdb_fresh=args.fresh
+    )
 
 
 if __name__ == "__main__":

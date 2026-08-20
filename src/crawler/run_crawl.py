@@ -46,6 +46,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Write CSV only; do not import into Excel / AccDB",
     )
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help="Delete existing AccDB files beside the workbook and write a new snapshot (no GUI prompt)",
+    )
     args = parser.parse_args(argv)
     return run_interactive(
         workers=args.workers,
@@ -53,6 +58,7 @@ def main(argv: list[str] | None = None) -> int:
         workbook=args.workbook,
         target_mode=args.target,
         use_gui=not args.no_gui,
+        accdb_fresh=args.fresh,
     )
 
 

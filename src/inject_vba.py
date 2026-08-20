@@ -1,5 +1,5 @@
 """
-Close AccDB-Blank_LAN_Crawler Tool.xlsm if open, silently inject VBA from src/vba, reopen.
+Close Lan_Search_Tool.xlsm if open, silently inject VBA from src/vba, reopen.
 
 Pattern aligned with MasterDatabase/src/close_excel.py (xlwings silence protocol).
 """
@@ -20,7 +20,7 @@ vbext_ct_Document = 100
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SRC_DIR = Path(__file__).resolve().parent
-DEFAULT_WORKBOOK = PROJECT_ROOT / "AccDB-Blank_LAN_Crawler Tool.xlsm"
+DEFAULT_WORKBOOK = PROJECT_ROOT / "Lan_Search_Tool.xlsm"
 VBA_SOURCE_DIR = SRC_DIR / "vba"
 
 if str(SRC_DIR) not in sys.path:

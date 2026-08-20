@@ -7,11 +7,13 @@
 *.xlsm
 # Allowed blank templates only (repo root)
 !/Blank_LAN_Crawler Tool.xlsm
-!/AccDB-Blank_LAN_Crawler Tool.xlsm
+!/Lan_Search_Tool.xlsm
 
 # Explicit block of the live tool workbook (any path)
 LAN Search Tool.xlsm
 **/LAN Search Tool.xlsm
+AccDB-Blank_LAN_Crawler Tool.xlsm
+**/AccDB-Blank_LAN_Crawler Tool.xlsm
 
 # --- Crawl / runtime output ---
 crawl_output/
@@ -34,6 +36,8 @@ build/
 .venv/
 venv/
 env/
+.portable_venv/
+vendor/wheels/
 Archives/
 
 # --- Env / credentials ---
