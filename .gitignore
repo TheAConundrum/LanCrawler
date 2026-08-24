@@ -49,6 +49,7 @@ credentials.json
 
 # --- IDE / OS ---
 .vscode/*
+!.vscode/settings.json
 !.vscode/tasks.json
 !.vscode/extensions.json
 .idea/

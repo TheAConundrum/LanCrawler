@@ -18,11 +18,17 @@ LAN crawls are dominated by waiting on directory listings. Multiple workers over
 **Run Task:** `Crawl LAN folder (picker)`  
 or `run_crawl.cmd` / `src/crawler/run_crawl.py`
 
-A small GUI asks for the folder / drive to crawl (workbook defaults to `Lan_Search_Tool.xlsm`). If an AccDB already exists:
+A GUI asks for the folder / drive, worker count, and update mode (workbook defaults to `Lan_Search_Tool.xlsm`). A **live progress window** shows folders done, full listings vs quick skips, files, pending, and errors.
 
-> Do you want to add to the DB taken on *date*, or delete it and start fresh?
+**Quick update** (default when an AccDB already exists): skip a full `scandir` on folders whose directory timestamp is unchanged. Still re-stats known indexed files (so a resave to a new date is captured) and still walks known subfolders (so a file added in a child folder is captured). Other crawl roots already in the AccDB are kept.
 
-**Add** ReplaceRoot-merges that folder into the same AccDB (keeps other roots + `tblIngested`). **Start fresh** deletes `DB\SearchIndex-*.accdb` and `LAN_Search_Index.accdb`, then creates `SearchIndex-{today}.accdb`. If the AccDB is already gone, no prompt — a new dated file is created. AccDB crawls write the index in memory → AccDB only (no `crawl_output` CSV).
+**Full recrawl**: re-list every folder under the selected path (ReplaceRoot merge; other drives stay).
+
+**Start fresh**: deletes `DB\SearchIndex-*.accdb` and `LAN_Search_Index.accdb`, then creates `SearchIndex-{today}.accdb`.
+
+The first crawl after this upgrade has no folder timestamps yet, so it is a full listing. That run writes `tblFolderMeta`; later weekly runs can be quick.
+
+If the AccDB is already gone, no prompt — a new dated file is created. AccDB crawls write the index in memory → AccDB only (no `crawl_output` CSV).
 
 Keep `Blank_LAN_Crawler Tool.xlsm` as the stable non-AccDB template; AccDB work uses `Lan_Search_Tool.xlsm`.
 
@@ -37,12 +43,13 @@ python -m crawler "\\fileserver\share$\Some Folder" -w 24
 | Flag | Meaning |
 |------|---------|
 | `-w` / `--workers` | Parallel folder workers (default **16**; try 8–32) |
+| `--full` | Re-list every folder (skip quick update) |
 | `-o path.csv` | Optional CSV dump (not written unless this flag is set) |
 | `--accdb path.accdb` | Write AccDB `tblFiles` |
 | `--target Auto\|Workbook\|AccDB` | Exclusive index mode with `--import-excel` |
 | `--fresh` | Delete existing AccDB files, then write a new snapshot (CLI; no GUI prompt) |
-| `--unc-root \\server\share` | Override if mapped-drive → UNC fails |
-| `--import-excel "..\Lan_Search_Tool.xlsm"` | Workbook for sheet import or AccDB relative `\DB\` path |
+| `--unc-root \\server\\share` | Override if mapped-drive → UNC fails |
+| `--import-excel "..\\Lan_Search_Tool.xlsm"` | Workbook for sheet import or AccDB relative `\DB\` path |
 
 ### Crawl + AccDB / Excel
 
@@ -67,11 +74,13 @@ The packer downloads wheels for Python **3.10–3.14** (32-bit and 64-bit Window
 | Column | Meaning |
 |--------|---------|
 | FilePath | UNC path |
-| FileDate | `yyyy-mm-dd` (Windows creation time when available) |
+| FileDate | `yyyy-mm-dd` (**files: last modified**; folders: created) |
 | SizeMB | 2 decimals; min 0.01 |
 | EntryType | `FILE` or `FOLDER` |
 
-**FOLDER SizeMB** = recursive disk total of **all** files under that folder (including non-indexed extensions).
+AccDB also stores `tblFolderMeta` (directory mtime + local bytes) so the next **quick update** can skip unchanged folders.
+
+**FOLDER SizeMB** = recursive disk total of **all** files under that folder (including non-indexed extensions). On a quick skip, folder SizeMB for unchanged trees stays as last fully listed.
 
 ## Filters (parity with VBA)
 
@@ -84,8 +93,9 @@ The packer downloads wheels for Python **3.10–3.14** (32-bit and 64-bit Window
 ```text
 src/crawler/
   __main__.py         CLI
-  crawl.py            Thread-pool crawler + write_accdb
-  crawl_gui.py        Folder GUI + AccDB add/fresh dialog
+  crawl.py            Thread-pool crawler + AccDB write
+  crawl_gui.py        Setup + live progress window
+  index_state.py      Previous-index snapshots for quick update
   filters.py          Allowlist / junk / split volumes
   paths.py            UNC resolve, size helpers
   import_to_excel.py  Sheet import + clear_onboard_tblfiles
@@ -98,5 +108,6 @@ src/pack_portable.py  Zip colleague kit (pack_portable.cmd)
 
 1. Prefer **UNC** paths when possible (one less mapping hop).
 2. If the server feels saturated, **lower** `--workers` (e.g. 8). If it feels idle, try **24–32**.
-3. After AccDB write, reopen the workbook so search resolves the AccDB backend (sheet is cleared).
-4. ACE must be installed on machines that crawl to AccDB **and** on machines that search AccDB from Excel.
+3. Weekly runs should use **Quick update**. Use **Full recrawl** if you suspect missed files (some NAS boxes do not update folder dates).
+4. After AccDB write, reopen the workbook so search resolves the AccDB backend (sheet is cleared).
+5. ACE must be installed on machines that crawl to AccDB **and** on machines that search AccDB from Excel.

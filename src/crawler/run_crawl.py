@@ -31,6 +31,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Parallel folder workers (default 16)",
     )
     parser.add_argument(
+        "--full",
+        action="store_true",
+        help="Re-list every folder (skip quick update)",
+    )
+    parser.add_argument(
         "--target",
         choices=("Auto", "Workbook", "AccDB"),
         default=None,
@@ -59,6 +64,8 @@ def main(argv: list[str] | None = None) -> int:
         target_mode=args.target,
         use_gui=not args.no_gui,
         accdb_fresh=args.fresh,
+        incremental=not args.full,
+        full_crawl=args.full,
     )
 
 

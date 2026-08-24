@@ -107,7 +107,7 @@ Results: **A:K** File (blue; **double-click** opens folder) | **L** File Type | 
 
 ### Database
 
-- `tblFiles`: **FilePath** | **FileDate** | **SizeMB** | **EntryType** (`FILE` / `FOLDER`)
+- `tblFiles`: **FilePath** | **FileDate** (files: last modified from the Python crawler) | **SizeMB** | **EntryType** (`FILE` / `FOLDER`)
 - Used when the session backend is Sheet. Empty when AccDB is the exclusive index.
 
 ### AccDB (beside workbook)

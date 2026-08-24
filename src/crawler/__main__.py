@@ -92,6 +92,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Delete existing workbook DB\\ AccDB files and write a new snapshot",
     )
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="Re-list every folder (skip quick update)",
+    )
     args = parser.parse_args(argv)
 
     csv_path = args.output
@@ -113,6 +118,26 @@ def main(argv: list[str] | None = None) -> int:
     def on_progress(msg: str) -> None:
         print(msg, flush=True)
 
+    previous = None
+    use_inc = not args.full and not args.fresh
+    load_from = accdb_path
+    if load_from is None and args.import_excel is not None:
+        load_from = accdb_path_for_workbook(args.import_excel)
+    if use_inc and load_from is not None and Path(load_from).is_file():
+        from crawler.crawl import load_previous_index
+
+        print("Loading previous index for quick update...", flush=True)
+        try:
+            previous = load_previous_index(load_from, unc)
+        except Exception as exc:  # noqa: BLE001
+            print(f"Could not load previous index ({exc}); full listing.", flush=True)
+            previous = None
+        use_inc = bool(previous is not None and previous.has_meta)
+        if use_inc:
+            print(f"Quick update: {len(previous.folders):,} folders with timestamps.", flush=True)
+        else:
+            print("No folder timestamps yet — full listing this run.", flush=True)
+
     t0 = time.time()
     rows, stats = crawl_parallel(
         args.root,
@@ -121,6 +146,8 @@ def main(argv: list[str] | None = None) -> int:
         unc_root_override=args.unc_root,
         progress_every=max(1, args.progress_every),
         on_progress=on_progress,
+        incremental=use_inc,
+        previous=previous,
     )
 
     if csv_path is not None:
@@ -129,6 +156,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print(
         f"Stats: files={stats.files_indexed:,} folders={stats.folders_indexed:,} "
+        f"scan={stats.folders_scanned:,} quick={stats.folders_quick:,} "
         f"errors={stats.errors:,} disk~{bytes_to_size_mb(stats.bytes_all_files):,.2f} MB "
         f"crawl={stats.elapsed:.1f}s"
     )
@@ -173,7 +201,7 @@ def main(argv: list[str] | None = None) -> int:
         if accdb_path is None:
             raise SystemExit("AccDB path required (--accdb or --import-excel for relative DB path)")
         write_accdb(rows, accdb_path, crawl_root=unc)
-        print(f"Wrote AccDB {accdb_path} (tblFiles + tblIngested)")
+        print(f"Wrote AccDB {accdb_path} (tblFiles + tblFolderMeta + tblIngested)")
         if args.import_excel is not None:
             from crawler.import_to_excel import clear_onboard_tblfiles
 

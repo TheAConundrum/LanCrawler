@@ -72,19 +72,23 @@ HOW TO RUN
    internet).
 
 3. When the window opens, click Browse and pick the folder or drive
-   you want to index, then click Start crawl.
+   you want to index. Set workers if you want (16 is the default).
+   Then choose an update mode and click Start crawl.
 
-4. If you already crawled before, you will be asked:
+      Quick update     - skip folders that have not changed; still
+                         picks up resaved files and new files in
+                         subfolders (recommended after the first crawl)
+      Full recrawl     - re-list every folder under this path
+      Start fresh      - erase the old index and use only this crawl
 
-      Do you want to add to the DB taken on <date>,
-      or delete it and start fresh?
+   The first crawl (or the first crawl after this upgrade) is always
+   a full listing so folder timestamps can be stored.
 
-   - Add to existing  - keep the previous index and add this folder
-   - Start fresh      - erase the old index and use only this crawl
-   - Cancel           - do nothing
+4. A progress window shows folders, files, pending, and errors.
+   Wait until it says Finished, then click Close.
 
-5. Wait until the crawl finishes. You can add another folder later by
-   running run_crawl.cmd again and choosing Add to existing.
+5. You can add another folder later by running run_crawl.cmd again
+   and choosing Quick update (or Full recrawl).
 
 6. At the end you will be asked:
 
@@ -141,7 +145,7 @@ IF SOMETHING GOES WRONG
 
     AccessDatabaseEngine_X64.exe /quiet
 
-  Then close Excel and run run_crawl.cmd again (choose Add to existing
+  Then close Excel and run run_crawl.cmd again (choose Quick update
   if this folder was already crawled, or Start fresh).
 
   Also close Lan_Search_Tool.xlsm before crawling if the database is open.

@@ -11,8 +11,10 @@ import shutil
 import struct
 import sys
 import tempfile
+import threading
 import time
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from collections import deque
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -34,6 +36,14 @@ try:
         is_junk_file_name,
         is_junk_folder_name,
     )
+    from .index_state import (
+        FolderMetaRow,
+        FolderSnapshot,
+        PreviousIndex,
+        build_previous_index,
+        folder_mtime_unchanged,
+        row_size_bytes,
+    )
     from .paths import (
         bytes_to_size_mb,
         build_drive_map,
@@ -53,6 +63,14 @@ except ImportError:  # python crawl.py (direct / right-click Run)
         is_junk_file_name,
         is_junk_folder_name,
     )
+    from crawler.index_state import (  # type: ignore
+        FolderMetaRow,
+        FolderSnapshot,
+        PreviousIndex,
+        build_previous_index,
+        folder_mtime_unchanged,
+        row_size_bytes,
+    )
     from crawler.paths import (  # type: ignore
         bytes_to_size_mb,
         build_drive_map,
@@ -68,15 +86,18 @@ ENTRY_FILE = "FILE"
 ENTRY_FOLDER = "FOLDER"
 
 ProgressCb = Callable[[str], None]
+StatsCb = Callable[["CrawlStats"], None]
 
 
 @dataclass
 class IndexRow:
     path: str
-    file_date: str  # yyyy-mm-dd or ""
+    file_date: str  # yyyy-mm-dd (files: last modified; folders: created)
     size_mb: float
     entry_type: str
     size_unknown: bool = False  # True only when the crawl stat failed
+    mtime_ts: float = 0.0  # file mtime or folder dir mtime
+    size_bytes: int = 0  # file bytes or folder local (non-recursive) bytes
 
 
 @dataclass
@@ -88,17 +109,27 @@ class FolderScanResult:
     file_rows: list[IndexRow] = field(default_factory=list)
     subfolders: list[str] = field(default_factory=list)
     error: str = ""
+    dir_mtime: float = 0.0
+    skipped: bool = False  # True = dir mtime unchanged; restated known files only
 
 
 @dataclass
 class CrawlStats:
     folders_scanned: int = 0
+    folders_quick: int = 0
     files_indexed: int = 0
     folders_indexed: int = 0
     bytes_all_files: int = 0
     errors: int = 0
+    pending: int = 0
+    cancelled: bool = False
+    incremental: bool = False
     started: float = 0.0
     finished: float = 0.0
+
+    @property
+    def folders_done(self) -> int:
+        return self.folders_scanned + self.folders_quick
 
     @property
     def elapsed(self) -> float:
@@ -135,6 +166,7 @@ def scan_folder(
 
     try:
         st_root = os.stat(folder_path, follow_symlinks=False)
+        result.dir_mtime = float(st_root.st_mtime)
         result.created_date = _date_only_from_timestamp(
             getattr(st_root, "st_ctime", None) or st_root.st_mtime
         )
@@ -178,20 +210,107 @@ def scan_folder(
             continue
 
         unc = to_unc_path(entry.path, drive_map, unc_root_override)
-        created = ""
-        if st is not None:
-            created = _date_only_from_timestamp(getattr(st, "st_ctime", None) or st.st_mtime)
+        mtime_ts = float(st.st_mtime) if st is not None else 0.0
+        modified = _date_only_from_timestamp(mtime_ts if mtime_ts else None)
 
         result.file_rows.append(
             IndexRow(
                 path=unc,
-                file_date=created,
+                file_date=modified,
                 size_mb=bytes_to_size_mb(size),
                 entry_type=ENTRY_FILE,
                 size_unknown=size_unknown,
+                mtime_ts=mtime_ts,
+                size_bytes=int(size),
             )
         )
 
+    return result
+
+
+def restat_known_files(
+    prev: FolderSnapshot,
+) -> tuple[list[IndexRow], int]:
+    """Re-stat indexed files in an unchanged folder (catches in-place resaves)."""
+    new_rows: list[IndexRow] = []
+    old_indexed = 0
+    new_indexed = 0
+    for snap in prev.files:
+        old_b = row_size_bytes(snap.size_bytes, snap.size_mb)
+        old_indexed += old_b
+        try:
+            st = os.stat(snap.path, follow_symlinks=False)
+            size = int(st.st_size)
+            mtime_ts = float(st.st_mtime)
+            new_rows.append(
+                IndexRow(
+                    path=snap.path,
+                    file_date=_date_only_from_timestamp(mtime_ts),
+                    size_mb=bytes_to_size_mb(size),
+                    entry_type=ENTRY_FILE,
+                    mtime_ts=mtime_ts,
+                    size_bytes=size,
+                )
+            )
+            new_indexed += size
+        except OSError:
+            continue
+    local_bytes = int(prev.local_bytes) - old_indexed + new_indexed
+    if local_bytes < 0:
+        local_bytes = new_indexed
+    return new_rows, local_bytes
+
+
+def visit_folder(
+    folder_path: str,
+    drive_map: dict[str, str],
+    unc_root_override: str,
+    prev: FolderSnapshot | None,
+    incremental: bool,
+) -> FolderScanResult:
+    """Full scandir, or skip listing when dir mtime is unchanged."""
+    folder_unc = to_unc_path(folder_path, drive_map, unc_root_override)
+    dir_mtime = 0.0
+    created = ""
+    try:
+        st_root = os.stat(folder_path, follow_symlinks=False)
+        dir_mtime = float(st_root.st_mtime)
+        created = _date_only_from_timestamp(
+            getattr(st_root, "st_ctime", None) or st_root.st_mtime
+        )
+    except OSError as exc:
+        return FolderScanResult(
+            folder_path=folder_path,
+            folder_unc=folder_unc,
+            created_date="",
+            local_bytes=0,
+            error=str(exc),
+        )
+
+    can_skip = (
+        incremental
+        and prev is not None
+        and folder_mtime_unchanged(dir_mtime, prev.dir_mtime)
+    )
+    if can_skip:
+        assert prev is not None
+        file_rows, local_bytes = restat_known_files(prev)
+        return FolderScanResult(
+            folder_path=folder_path,
+            folder_unc=folder_unc,
+            created_date=prev.created_date or created,
+            local_bytes=local_bytes,
+            file_rows=file_rows,
+            subfolders=list(prev.child_uncs),
+            dir_mtime=dir_mtime,
+            skipped=True,
+        )
+
+    result = scan_folder(folder_path, drive_map, unc_root_override)
+    if not result.dir_mtime:
+        result.dir_mtime = dir_mtime
+    if not result.created_date:
+        result.created_date = created
     return result
 
 
@@ -224,33 +343,86 @@ def crawl_parallel(
     unc_root_override: str = "",
     progress_every: int = 50,
     on_progress: ProgressCb | None = None,
+    on_stats: StatsCb | None = None,
+    incremental: bool = False,
+    previous: PreviousIndex | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> tuple[list[IndexRow], CrawlStats]:
-    """Crawl root_path with a thread pool. Returns (tblFiles rows, stats)."""
+    """Crawl root_path with a thread pool. Returns (tblFiles rows, stats).
+
+    incremental=True plus a PreviousIndex with folder timestamps: skip scandir on
+    unchanged folders, re-stat known files, and still walk known child folders.
+    """
     start = ensure_crawl_start(root_path)
     start_s = str(start)
     drive_map = drive_map if drive_map is not None else {}
     crawl_root_unc = to_unc_path(start_s, drive_map, unc_root_override)
+    use_incremental = bool(incremental and previous is not None and previous.has_meta)
 
-    stats = CrawlStats(started=time.time())
+    stats = CrawlStats(started=time.time(), incremental=use_incremental)
     file_rows: list[IndexRow] = []
     folder_meta: dict[str, str] = {}
+    folder_mtime: dict[str, float] = {}
     local_bytes: dict[str, int] = {}
 
     def emit(msg: str) -> None:
         if on_progress:
             on_progress(msg)
 
+    def push_stats() -> None:
+        stats.files_indexed = len(file_rows)
+        stats.folders_indexed = len(folder_meta)
+        if on_stats:
+            on_stats(stats)
+
+    def mark_seen(path: str, seen: set[str]) -> bool:
+        key = _norm_key(path)
+        unc_key = _norm_key(to_unc_path(path, drive_map, unc_root_override))
+        if key in seen or unc_key in seen:
+            return False
+        seen.add(key)
+        if unc_key:
+            seen.add(unc_key)
+        return True
+
     seen: set[str] = set()
     n_workers = max(1, int(workers))
+    max_outstanding = max(n_workers * 8, 32)
+    queued: deque[str] = deque()
+    in_flight: dict[Future, str] = {}
+
+    mark_seen(start_s, seen)
+    queued.append(start_s)
+
+    def submit_more(pool: ThreadPoolExecutor) -> None:
+        while queued and len(in_flight) < max_outstanding:
+            if cancel_event is not None and cancel_event.is_set():
+                return
+            path = queued.popleft()
+            prev_snap = previous.get(to_unc_path(path, drive_map, unc_root_override)) if previous else None
+            fut = pool.submit(
+                visit_folder,
+                path,
+                drive_map,
+                unc_root_override,
+                prev_snap,
+                use_incremental,
+            )
+            in_flight[fut] = path
 
     with ThreadPoolExecutor(max_workers=n_workers, thread_name_prefix="lan-crawl") as pool:
-        pending = set()
-        seen.add(_norm_key(start_s))
-        pending.add(pool.submit(scan_folder, start_s, drive_map, unc_root_override))
-
-        while pending:
-            done, pending = wait(pending, return_when=FIRST_COMPLETED)
+        submit_more(pool)
+        while in_flight or queued:
+            if cancel_event is not None and cancel_event.is_set() and not in_flight:
+                break
+            if not in_flight:
+                submit_more(pool)
+                if not in_flight:
+                    break
+            done, _still = wait(list(in_flight.keys()), return_when=FIRST_COMPLETED)
+            progressed = False
             for fut in done:
+                in_flight.pop(fut, None)
                 try:
                     res: FolderScanResult = fut.result()
                 except Exception as exc:  # noqa: BLE001 — isolate worker failures
@@ -261,30 +433,55 @@ def crawl_parallel(
                 if res.error:
                     stats.errors += 1
                     emit(f"skip {res.folder_path}: {res.error}")
-                else:
-                    stats.folders_scanned += 1
+                elif res.skipped:
+                    stats.folders_quick += 1
+                    progressed = True
                     if res.folder_unc:
                         folder_meta[res.folder_unc] = res.created_date
+                        folder_mtime[res.folder_unc] = res.dir_mtime
+                        local_bytes[res.folder_unc] = res.local_bytes
+                    file_rows.extend(res.file_rows)
+                else:
+                    stats.folders_scanned += 1
+                    progressed = True
+                    if res.folder_unc:
+                        folder_meta[res.folder_unc] = res.created_date
+                        folder_mtime[res.folder_unc] = res.dir_mtime
                         local_bytes[res.folder_unc] = local_bytes.get(res.folder_unc, 0) + res.local_bytes
                     file_rows.extend(res.file_rows)
 
-                    if stats.folders_scanned % progress_every == 0:
-                        emit(
-                            f"folders={stats.folders_scanned:,} "
-                            f"files={len(file_rows):,} "
-                            f"pending={len(pending):,} "
-                            f"errors={stats.errors:,}"
-                        )
-
                 for sub in res.subfolders:
-                    key = _norm_key(sub)
-                    if key in seen:
-                        continue
-                    # Skip junk by name even if parent listing included it
                     if is_junk_folder_name(Path(sub).name):
                         continue
-                    seen.add(key)
-                    pending.add(pool.submit(scan_folder, sub, drive_map, unc_root_override))
+                    if mark_seen(sub, seen):
+                        queued.append(sub)
+
+            stats.pending = len(in_flight) + len(queued)
+            if progressed and stats.folders_done > 0 and stats.folders_done % progress_every == 0:
+                emit(
+                    f"folders={stats.folders_done:,} "
+                    f"scan={stats.folders_scanned:,} "
+                    f"quick={stats.folders_quick:,} "
+                    f"files={len(file_rows):,} "
+                    f"pending={stats.pending:,} "
+                    f"errors={stats.errors:,}"
+                )
+            push_stats()
+            if cancel_event is not None and cancel_event.is_set():
+                queued.clear()
+                stats.cancelled = True
+                emit("cancelled — stopping after in-flight folders")
+                # Drain remaining futures so the pool can exit cleanly
+                continue
+            submit_more(pool)
+
+    if stats.cancelled:
+        stats.files_indexed = len(file_rows)
+        stats.folders_indexed = len(folder_meta)
+        stats.finished = time.time()
+        emit(f"cancelled after folders={stats.folders_done:,} files={len(file_rows):,}")
+        push_stats()
+        return [], stats
 
     totals = _bubble_folder_bytes(local_bytes, crawl_root_unc)
 
@@ -296,6 +493,8 @@ def crawl_parallel(
                 file_date=created,
                 size_mb=bytes_to_size_mb(totals.get(unc, 0)),
                 entry_type=ENTRY_FOLDER,
+                mtime_ts=folder_mtime.get(unc, 0.0),
+                size_bytes=int(local_bytes.get(unc, 0)),
             )
         )
 
@@ -306,12 +505,15 @@ def crawl_parallel(
     stats.files_indexed = sum(1 for r in rows if r.entry_type == ENTRY_FILE)
     stats.folders_indexed = sum(1 for r in rows if r.entry_type == ENTRY_FOLDER)
     stats.bytes_all_files = sum(local_bytes.values())
+    stats.pending = 0
     stats.finished = time.time()
     emit(
         f"done files={stats.files_indexed:,} folders={stats.folders_indexed:,} "
+        f"scan={stats.folders_scanned:,} quick={stats.folders_quick:,} "
         f"errors={stats.errors:,} elapsed={stats.elapsed:.1f}s "
         f"disk_bytes={stats.bytes_all_files:,}"
     )
+    push_stats()
     return rows, stats
 
 
@@ -811,6 +1013,24 @@ def _ensure_accdb_tables(cur, conn) -> None:
         except Exception:  # noqa: BLE001
             conn.rollback()
 
+    if not _accdb_table_exists(cur, "tblFolderMeta"):
+        cur.execute(
+            """
+            CREATE TABLE tblFolderMeta (
+                FolderPath TEXT NOT NULL,
+                DirMtime DOUBLE,
+                LocalBytes DOUBLE,
+                CreatedDate TEXT
+            )
+            """
+        )
+        conn.commit()
+        try:
+            cur.execute("CREATE INDEX ix_tblFolderMeta_path ON tblFolderMeta (FolderPath)")
+            conn.commit()
+        except Exception:  # noqa: BLE001
+            conn.rollback()
+
     if not _accdb_table_exists(cur, "tblIngested"):
         cur.execute(
             """
@@ -823,6 +1043,145 @@ def _ensure_accdb_tables(cur, conn) -> None:
             )
             """
         )
+        conn.commit()
+    """Open AccDB via pyodbc, else ACE OLEDB. Caller must close."""
+    try:
+        import pyodbc  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError(
+            "Writing AccDB requires pyodbc. Install: pip install pyodbc"
+        ) from exc
+
+    last_err: Exception | None = None
+    for conn_str in _accdb_connection_strings(out_path):
+        try:
+            return pyodbc.connect(conn_str, autocommit=False)
+        except Exception as exc:  # noqa: BLE001
+            last_err = exc
+    ado = _open_accdb_ado(out_path)
+    if ado is not None:
+        return ado
+    raise RuntimeError(_ace_missing_message(last_err)) from last_err
+
+
+def _under_root_params(root: str) -> tuple[str, int, str]:
+    root = strip_trailing_slash(root)
+    prefix = root + "\\"
+    return root.upper(), len(prefix), prefix.upper()
+
+
+def load_previous_index(accdb_path: str | Path, crawl_root: str) -> PreviousIndex | None:
+    """Load tblFiles + tblFolderMeta under crawl_root. None if the AccDB is missing."""
+    path = Path(accdb_path)
+    if not path.is_file():
+        return None
+    root = strip_trailing_slash(crawl_root)
+    if not root:
+        return None
+
+    conn = _open_accdb(path)
+    try:
+        cur = conn.cursor()
+        if not _accdb_table_exists(cur, "tblFiles"):
+            return PreviousIndex(has_meta=False)
+
+        root_u, prefix_len, prefix_u = _under_root_params(root)
+        cur.execute(
+            "SELECT FilePath, FileDate, SizeMB, EntryType FROM tblFiles "
+            "WHERE UCase(FilePath)=? OR Left(UCase(FilePath),?)=?",
+            (root_u, prefix_len, prefix_u),
+        )
+        file_rows: list[tuple[str, str, float, str]] = []
+        for rec in cur.fetchall():
+            path_txt = strip_trailing_slash(str(rec[0] or "").strip())
+            date_val = rec[1]
+            if date_val is None:
+                date_txt = ""
+            elif hasattr(date_val, "isoformat"):
+                date_txt = date_val.isoformat()[:10]
+            else:
+                date_txt = str(date_val).strip()[:10]
+            try:
+                size_mb = float(rec[2] or 0)
+            except (TypeError, ValueError):
+                size_mb = 0.0
+            et = str(rec[3] or "FILE").strip()
+            file_rows.append((path_txt, date_txt, size_mb, et))
+
+        meta_rows: list[FolderMetaRow] = []
+        if _accdb_table_exists(cur, "tblFolderMeta"):
+            cur.execute(
+                "SELECT FolderPath, DirMtime, LocalBytes, CreatedDate FROM tblFolderMeta "
+                "WHERE UCase(FolderPath)=? OR Left(UCase(FolderPath),?)=?",
+                (root_u, prefix_len, prefix_u),
+            )
+            for rec in cur.fetchall():
+                folder_path = strip_trailing_slash(str(rec[0] or "").strip())
+                if not folder_path:
+                    continue
+                try:
+                    dir_mtime = float(rec[1] or 0)
+                except (TypeError, ValueError):
+                    dir_mtime = 0.0
+                try:
+                    local_b = int(float(rec[2] or 0))
+                except (TypeError, ValueError):
+                    local_b = 0
+                created = ""
+                if rec[3] is not None:
+                    created = str(rec[3]).strip()[:10]
+                meta_rows.append(
+                    FolderMetaRow(
+                        folder_path=folder_path,
+                        dir_mtime=dir_mtime,
+                        local_bytes=local_b,
+                        created_date=created,
+                    )
+                )
+
+        return build_previous_index(file_rows=file_rows, meta_rows=meta_rows)
+    finally:
+        conn.close()
+
+
+def _delete_folder_meta_under_root(cur, root: str) -> None:
+    if not _accdb_table_exists(cur, "tblFolderMeta"):
+        return
+    root = strip_trailing_slash(root)
+    if not root:
+        return
+    root_u, prefix_len, prefix_u = _under_root_params(root)
+    cur.execute(
+        "DELETE FROM tblFolderMeta WHERE UCase(FolderPath)=? OR Left(UCase(FolderPath),?)=?",
+        (root_u, prefix_len, prefix_u),
+    )
+
+
+def _insert_folder_meta_rows(cur, conn, rows: list[IndexRow]) -> None:
+    folders = [r for r in rows if r.entry_type == ENTRY_FOLDER]
+    if not folders:
+        return
+    insert_sql = (
+        "INSERT INTO tblFolderMeta (FolderPath, DirMtime, LocalBytes, CreatedDate) "
+        "VALUES (?, ?, ?, ?)"
+    )
+    batch: list[tuple[str, float, float, str | None]] = []
+    batch_size = 2000
+    for r in folders:
+        batch.append(
+            (
+                strip_trailing_slash(r.path),
+                float(r.mtime_ts or 0.0),
+                float(r.size_bytes or 0),
+                r.file_date or None,
+            )
+        )
+        if len(batch) >= batch_size:
+            cur.executemany(insert_sql, batch)
+            conn.commit()
+            batch.clear()
+    if batch:
+        cur.executemany(insert_sql, batch)
         conn.commit()
 
 
@@ -931,7 +1290,7 @@ def _insert_accdb_file_rows(cur, conn, rows: list[IndexRow]) -> None:
         "INSERT INTO tblFiles (FilePath, FileDate, SizeMB, EntryType) VALUES (?, ?, ?, ?)"
     )
     batch: list[tuple[str, str | None, float, str]] = []
-    batch_size = 500
+    batch_size = 2000
     for r in rows:
         batch.append((r.path, r.file_date or None, float(r.size_mb), r.entry_type))
         if len(batch) >= batch_size:
@@ -958,13 +1317,6 @@ def write_accdb(
     this crawl_root (and child ingest entries). Full wipe only when replace_root=False
     or the AccDB file is new.
     """
-    try:
-        import pyodbc  # type: ignore
-    except ImportError as exc:
-        raise RuntimeError(
-            "Writing AccDB requires pyodbc. Install: pip install pyodbc"
-        ) from exc
-
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -983,25 +1335,7 @@ def write_accdb(
         _create_empty_accdb(out_path)
         created_new = True
 
-    conn = None
-    last_err: Exception | None = None
-    for conn_str in _accdb_connection_strings(out_path):
-        try:
-            conn = pyodbc.connect(conn_str, autocommit=False)
-            break
-        except Exception as exc:  # noqa: BLE001
-            last_err = exc
-    if conn is None:
-        ado = _open_accdb_ado(out_path)
-        if ado is not None:
-            print(
-                "Access ODBC driver not found; writing AccDB via ACE OLEDB instead.",
-                flush=True,
-            )
-            conn = ado
-        else:
-            raise RuntimeError(_ace_missing_message(last_err)) from last_err
-
+    conn = _open_accdb(out_path)
     try:
         cur = conn.cursor()
         _ensure_accdb_tables(cur, conn)
@@ -1015,7 +1349,13 @@ def write_accdb(
                 conn.commit()
             except Exception:  # noqa: BLE001
                 conn.rollback()
+            try:
+                cur.execute("DELETE FROM tblFolderMeta")
+                conn.commit()
+            except Exception:  # noqa: BLE001
+                conn.rollback()
             _insert_accdb_file_rows(cur, conn, rows)
+            _insert_folder_meta_rows(cur, conn, rows)
             if ingest_log is not None:
                 log_rows = [
                     r for r in ingest_log if not _is_synthetic_ingest_root(r.root_path)
@@ -1033,8 +1373,10 @@ def write_accdb(
 
         # ReplaceRoot merge: keep other roots, replace this root's files + ingest row
         deleted = _delete_accdb_files_under_root(cur, root)
+        _delete_folder_meta_under_root(cur, root)
         conn.commit()
         _insert_accdb_file_rows(cur, conn, rows)
+        _insert_folder_meta_rows(cur, conn, rows)
         assert new_ingest is not None
         if ingest_log is not None:
             log_rows = [
@@ -1170,6 +1512,8 @@ def run_interactive(
     target_mode: str | None = None,
     use_gui: bool = True,
     accdb_fresh: bool = False,
+    incremental: bool = True,
+    full_crawl: bool = False,
 ) -> int:
     """GUI/CLI entry: crawl → AccDB ReplaceRoot merge (or fresh snapshot)."""
     try:
@@ -1186,12 +1530,15 @@ def run_interactive(
     if mode not in ("Auto", "Workbook", "AccDB"):
         mode = "AccDB"
     want_fresh = bool(accdb_fresh)
+    want_incremental = bool(incremental) and not full_crawl and not want_fresh
+    live_gui = False
+    workers = max(1, min(48, int(workers)))
 
     if use_gui and workbook is None and target_mode is None:
         try:
-            from .crawl_gui import ask_accdb_merge_or_fresh, run_crawl_gui
+            from .crawl_gui import run_crawl_gui, run_progress_window
         except ImportError:
-            from crawler.crawl_gui import ask_accdb_merge_or_fresh, run_crawl_gui  # type: ignore
+            from crawler.crawl_gui import run_crawl_gui, run_progress_window  # type: ignore
 
         gui = run_crawl_gui(initial_workbook=workbook)
         if gui.cancelled:
@@ -1200,17 +1547,10 @@ def run_interactive(
         root = gui.root
         wb_path = Path(gui.workbook)
         mode = gui.target_mode
-        existing = existing_accdb_for_workbook(wb_path, warn=False)
-        if existing is not None:
-            taken = format_accdb_taken_on(existing)
-            print(f"Existing AccDB: {existing} (taken on {taken})", flush=True)
-            choice = ask_accdb_merge_or_fresh(taken_on=taken)
-            if choice == "cancel":
-                print("Cancelled.", flush=True)
-                return 0
-            want_fresh = choice == "fresh"
-        else:
-            want_fresh = False
+        workers = gui.workers
+        want_fresh = gui.accdb_fresh
+        want_incremental = gui.incremental and not want_fresh
+        live_gui = True
     else:
         print("Opening folder picker (check the taskbar if you do not see it)...", flush=True)
         root = pick_folder()
@@ -1254,9 +1594,15 @@ def run_interactive(
 
     drive_map = build_drive_map([root])
     unc = to_unc_path(root, drive_map, "")
+    crawl_mode_label = (
+        "Start fresh (wipe index)"
+        if want_fresh
+        else ("Quick update" if want_incremental else "Full recrawl")
+    )
     print(f"Root:    {root}", flush=True)
     print(f"UNC:     {unc}", flush=True)
     print(f"Workers: {workers}", flush=True)
+    print(f"Crawl:   {crawl_mode_label}", flush=True)
     print(f"Mode:    {mode}", flush=True)
     if wb_path is not None:
         print(f"Excel:   {wb_path}", flush=True)
@@ -1264,99 +1610,162 @@ def run_interactive(
         print(f"AccDB:   {accdb_out}", flush=True)
     print("---", flush=True)
 
-    def on_progress(msg: str) -> None:
-        print(msg, flush=True)
+    job: dict[str, object] = {"rows": None, "stats": None, "error": None}
 
-    t0 = time.time()
-    rows, stats = crawl_parallel(
-        root,
-        workers=workers,
-        drive_map=drive_map,
-        progress_every=progress_every,
-        on_progress=on_progress,
-    )
-    print("---", flush=True)
-    print(
-        f"Crawl done: {len(rows):,} rows  "
-        f"files={stats.files_indexed:,} folders={stats.folders_indexed:,} "
-        f"errors={stats.errors:,} disk~{bytes_to_size_mb(stats.bytes_all_files):,.2f} MB "
-        f"in {time.time() - t0:.1f}s",
-        flush=True,
-    )
+    def run_job(
+        cancel_event: threading.Event | None,
+        on_stats: StatsCb | None,
+        on_log: ProgressCb | None,
+    ) -> None:
+        def emit(msg: str) -> None:
+            print(msg, flush=True)
+            if on_log:
+                on_log(msg)
 
-    if wb_path is None:
-        out_dir = _default_out_dir()
-        stamp = time.strftime("%Y%m%d_%H%M%S")
-        csv_path = out_dir / f"{stamp}_tblFiles.csv"
-        write_csv(rows, csv_path)
-        print(f"Wrote CSV {csv_path} ({len(rows):,} rows).", flush=True)
-        return 0
+        previous = None
+        use_inc = want_incremental
+        if use_inc and accdb_out is not None and accdb_out.is_file():
+            emit("Loading previous index for quick update...")
+            try:
+                previous = load_previous_index(accdb_out, unc)
+            except Exception as exc:  # noqa: BLE001
+                emit(f"Could not load previous index ({exc}); doing a full listing.")
+                previous = None
+            if previous is None or not previous.has_meta:
+                emit(
+                    "No folder timestamps in this AccDB yet — full listing this run. "
+                    "Next quick update will skip unchanged folders."
+                )
+                use_inc = bool(previous is not None and previous.has_meta)
+            elif previous.has_meta:
+                emit(
+                    f"Quick update ready: {len(previous.folders):,} folders with timestamps."
+                )
+        elif use_inc:
+            use_inc = False
 
-    force_accdb = mode == "AccDB" or len(rows) > ACCDB_ROW_THRESHOLD
-    if mode == "Workbook" and len(rows) > ACCDB_ROW_THRESHOLD:
-        force_accdb = True
-        print(
-            f"Row count {len(rows):,} exceeds {ACCDB_ROW_THRESHOLD:,}; "
-            "forcing AccDB write for performance.",
-            flush=True,
+        t0 = time.time()
+        rows, stats = crawl_parallel(
+            root,
+            workers=workers,
+            drive_map=drive_map,
+            progress_every=progress_every,
+            on_progress=emit,
+            on_stats=on_stats,
+            incremental=use_inc,
+            previous=previous,
+            cancel_event=cancel_event,
         )
-    elif mode == "Auto" and len(rows) > ACCDB_ROW_THRESHOLD:
-        force_accdb = True
-        print(
-            f"Auto mode: {len(rows):,} rows > {ACCDB_ROW_THRESHOLD:,} → AccDB.",
-            flush=True,
+        job["rows"] = rows
+        job["stats"] = stats
+        if stats.cancelled or (cancel_event is not None and cancel_event.is_set()):
+            emit("Cancelled. Index was not updated.")
+            return
+        emit(
+            f"Crawl done: {len(rows):,} rows  "
+            f"files={stats.files_indexed:,} folders={stats.folders_indexed:,} "
+            f"scan={stats.folders_scanned:,} quick={stats.folders_quick:,} "
+            f"errors={stats.errors:,} disk~{bytes_to_size_mb(stats.bytes_all_files):,.2f} MB "
+            f"in {time.time() - t0:.1f}s"
         )
 
-    try:
+        if wb_path is None:
+            out_dir = _default_out_dir()
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            csv_path = out_dir / f"{stamp}_tblFiles.csv"
+            write_csv(rows, csv_path)
+            emit(f"Wrote CSV {csv_path} ({len(rows):,} rows).")
+            return
+
+        force_accdb = mode == "AccDB" or len(rows) > ACCDB_ROW_THRESHOLD
+        if mode == "Workbook" and len(rows) > ACCDB_ROW_THRESHOLD:
+            force_accdb = True
+            emit(
+                f"Row count {len(rows):,} exceeds {ACCDB_ROW_THRESHOLD:,}; "
+                "forcing AccDB write for performance."
+            )
+        elif mode == "Auto" and len(rows) > ACCDB_ROW_THRESHOLD:
+            force_accdb = True
+            emit(
+                f"Auto mode: {len(rows):,} rows > {ACCDB_ROW_THRESHOLD:,} → AccDB."
+            )
+
         if force_accdb:
             assert accdb_out is not None
-            print(f"Writing AccDB -> {accdb_out} ...", flush=True)
+            emit(f"Writing AccDB -> {accdb_out} ...")
             write_accdb(rows, accdb_out, crawl_root=unc)
-            print(f"Wrote AccDB ({len(rows):,} rows + ingestion log).", flush=True)
+            emit(f"Wrote AccDB ({len(rows):,} rows + folder timestamps).")
             try:
                 from .import_to_excel import clear_onboard_tblfiles
             except ImportError:
                 from crawler.import_to_excel import clear_onboard_tblfiles  # type: ignore
 
-            print("Clearing onboard Database!tblFiles so AccDB is exclusive...", flush=True)
+            emit("Clearing onboard Database!tblFiles so AccDB is exclusive...")
             clear_onboard_tblfiles(wb_path)
-            print(
+            emit(
                 f"Index deployed to AccDB:\n  {accdb_out}\n"
-                "Onboard sheet database was cleared. Re-open the workbook to search AccDB.",
-                flush=True,
+                "Re-open the workbook to search."
             )
-        else:
-            try:
-                from .import_to_excel import import_csv_to_workbook
-            except ImportError:
-                from crawler.import_to_excel import import_csv_to_workbook  # type: ignore
+            return
 
-            tmp = tempfile.NamedTemporaryFile(
-                prefix="lan_search_",
-                suffix=".csv",
-                delete=False,
+        try:
+            from .import_to_excel import import_csv_to_workbook
+        except ImportError:
+            from crawler.import_to_excel import import_csv_to_workbook  # type: ignore
+
+        tmp = tempfile.NamedTemporaryFile(
+            prefix="lan_search_",
+            suffix=".csv",
+            delete=False,
+        )
+        csv_path = Path(tmp.name)
+        tmp.close()
+        try:
+            write_csv(rows, csv_path)
+            emit(f"Importing (ReplaceRoot) into workbook {wb_path} ...")
+            total = import_csv_to_workbook(
+                workbook=wb_path,
+                csv_path=csv_path,
+                mode="ReplaceRoot",
+                unc_root=unc,
             )
-            csv_path = Path(tmp.name)
-            tmp.close()
+        finally:
             try:
-                write_csv(rows, csv_path)
-                print(f"Importing (ReplaceRoot) into workbook {wb_path} ...", flush=True)
-                total = import_csv_to_workbook(
-                    workbook=wb_path,
-                    csv_path=csv_path,
-                    mode="ReplaceRoot",
-                    unc_root=unc,
-                )
-            finally:
-                try:
-                    csv_path.unlink()
-                except OSError:
-                    pass
-            print(f"Excel import complete ({total:,} rows in tblFiles).", flush=True)
+                csv_path.unlink()
+            except OSError:
+                pass
+        emit(f"Excel import complete ({total:,} rows in tblFiles).")
+
+    if live_gui:
+        try:
+            from .crawl_gui import run_progress_window
+        except ImportError:
+            from crawler.crawl_gui import run_progress_window  # type: ignore
+
+        ok = run_progress_window(
+            root_label=unc or root,
+            mode_label=f"{crawl_mode_label}  ·  {workers} workers",
+            work=run_job,
+        )
+        err = job.get("error")
+        stats_obj = job.get("stats")
+        if isinstance(stats_obj, CrawlStats) and stats_obj.cancelled:
+            return 0
+        if not ok:
+            return 1
+        if err:
+            print(f"Index write failed: {err}", flush=True)
+            return 1
+        return 0
+
+    try:
+        run_job(None, None, None)
     except Exception as exc:  # noqa: BLE001
         print(f"Index write failed: {exc}", flush=True)
         return 1
-
+    stats_obj = job.get("stats")
+    if isinstance(stats_obj, CrawlStats) and stats_obj.cancelled:
+        return 0
     return 0
 
 

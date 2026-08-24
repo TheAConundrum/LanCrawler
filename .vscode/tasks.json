@@ -23,16 +23,18 @@
         },
         {
             "label": "Crawl LAN folder (picker)",
-            "type": "shell",
-            "command": "${command:python.interpreterPath}",
+            "type": "process",
+            "command": "${env:ComSpec}",
             "args": [
+                "/d",
+                "/c",
+                "${workspaceFolder}\\_task_python.cmd",
                 "${workspaceFolder}\\src\\crawler\\run_crawl.py"
             ],
             "options": {
                 "cwd": "${workspaceFolder}",
-                "shell": {
-                    "executable": "cmd.exe",
-                    "args": ["/d", "/c"]
+                "env": {
+                    "CURSOR_PYTHON": "${command:python.interpreterPath}"
                 }
             },
             "problemMatcher": [],
@@ -44,20 +46,22 @@
                 "showReuseMessage": false,
                 "clear": true
             },
-            "detail": "Crawl GUI → folder + Lan_Search_Tool.xlsm → AccDB merge or fresh snapshot."
+            "detail": "Crawl GUI → live progress, quick update or full recrawl → AccDB."
         },
         {
             "label": "SummitLANScan (all network drives)",
-            "type": "shell",
-            "command": "${command:python.interpreterPath}",
+            "type": "process",
+            "command": "${env:ComSpec}",
             "args": [
+                "/d",
+                "/c",
+                "${workspaceFolder}\\_task_python.cmd",
                 "${workspaceFolder}\\src\\crawler\\summit_lan_scan.py"
             ],
             "options": {
                 "cwd": "${workspaceFolder}",
-                "shell": {
-                    "executable": "cmd.exe",
-                    "args": ["/d", "/c"]
+                "env": {
+                    "CURSOR_PYTHON": "${command:python.interpreterPath}"
                 }
             },
             "problemMatcher": [],
@@ -73,17 +77,19 @@
         },
         {
             "label": "Unlock workbook for layout edit",
-            "type": "shell",
-            "command": "${command:python.interpreterPath}",
+            "type": "process",
+            "command": "${env:ComSpec}",
             "args": [
+                "/d",
+                "/c",
+                "${workspaceFolder}\\_task_python.cmd",
                 "${workspaceFolder}\\src\\unlock_workbook.py",
                 "${workspaceFolder}\\Lan_Search_Tool.xlsm"
             ],
             "options": {
                 "cwd": "${workspaceFolder}",
-                "shell": {
-                    "executable": "cmd.exe",
-                    "args": ["/d", "/c"]
+                "env": {
+                    "CURSOR_PYTHON": "${command:python.interpreterPath}"
                 }
             },
             "problemMatcher": [],
@@ -99,17 +105,19 @@
         },
         {
             "label": "1. Run Python Inject",
-            "type": "shell",
-            "command": "${command:python.interpreterPath}",
+            "type": "process",
+            "command": "${env:ComSpec}",
             "args": [
+                "/d",
+                "/c",
+                "${workspaceFolder}\\_task_python.cmd",
                 "${workspaceFolder}\\src\\inject_vba.py",
                 "${workspaceFolder}\\Lan_Search_Tool.xlsm"
             ],
             "options": {
                 "cwd": "${workspaceFolder}",
-                "shell": {
-                    "executable": "cmd.exe",
-                    "args": ["/d", "/c"]
+                "env": {
+                    "CURSOR_PYTHON": "${command:python.interpreterPath}"
                 }
             },
             "problemMatcher": [],
@@ -124,15 +132,18 @@
         },
         {
             "label": "2. Run xlwings Export",
-            "type": "shell",
-            "command": "powershell",
+            "type": "process",
+            "command": "${env:ComSpec}",
             "args": [
-                "-NoProfile",
-                "-Command",
-                "& { echo y | & '${command:python.interpreterPath}' -m xlwings vba export --file '${workspaceFolder}\\Lan_Search_Tool.xlsm' }"
+                "/d",
+                "/c",
+                "echo y | \"${workspaceFolder}\\_task_python.cmd\" -m xlwings vba export --file \"${workspaceFolder}\\Lan_Search_Tool.xlsm\""
             ],
             "options": {
-                "cwd": "${workspaceFolder}/src/vba"
+                "cwd": "${workspaceFolder}/src/vba",
+                "env": {
+                    "CURSOR_PYTHON": "${command:python.interpreterPath}"
+                }
             },
             "problemMatcher": [],
             "presentation": {

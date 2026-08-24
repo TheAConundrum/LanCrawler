@@ -4,7 +4,7 @@ LAN file-index crawler + Excel VBA search tool.
 
 ## What’s in this repo
 
-- `src/crawler/` — parallel Python crawler (AccDB / Excel import + crawl GUI)
+- `src/crawler/` — parallel Python crawler (quick update + live progress GUI; AccDB / Excel import)
 - `src/vba/` — VBA modules for the Excel workbook
 - `src/inject_vba.py` — inject VBA from disk into the `.xlsm`
 - `Lan_Search_Tool.xlsm` — AccDB search workbook (default inject / crawl target)

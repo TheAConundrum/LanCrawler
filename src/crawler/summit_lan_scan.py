@@ -18,6 +18,7 @@ if str(_SRC) not in sys.path:
 from crawler.crawl import (  # noqa: E402
     accdb_path_for_workbook,
     crawl_parallel,
+    load_previous_index,
     purge_workbook_accdbs,
     write_accdb,
 )
@@ -38,6 +39,7 @@ def run_summit_lan_scan(
     workbook: str | Path | None = None,
     progress_every: int = 50,
     accdb_fresh: bool = False,
+    full_crawl: bool = False,
 ) -> int:
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
@@ -70,6 +72,7 @@ def run_summit_lan_scan(
     print(f"Workbook: {wb_path}", flush=True)
     print(f"AccDB:    {accdb_out}", flush=True)
     print(f"Workers:  {workers} per drive", flush=True)
+    print(f"Update:   {'full recrawl' if full_crawl or accdb_fresh else 'quick update'}", flush=True)
     print(f"Drives:   {len(drives)}", flush=True)
     for letter, root, unc in drives:
         print(f"  {letter}  {root}  {unc}", flush=True)
@@ -89,6 +92,19 @@ def run_summit_lan_scan(
         print(f"  UNC: {unc}", flush=True)
 
         t0 = time.time()
+        previous = None
+        use_inc = not full_crawl and not accdb_fresh
+        if use_inc and accdb_out.is_file():
+            try:
+                previous = load_previous_index(accdb_out, unc)
+            except Exception as exc:  # noqa: BLE001
+                print(f"  (previous index skipped: {exc})", flush=True)
+                previous = None
+            use_inc = bool(previous is not None and previous.has_meta)
+            if use_inc:
+                print(f"  Quick update: {len(previous.folders):,} known folders", flush=True)
+            else:
+                print("  No folder timestamps yet — full listing this drive", flush=True)
         try:
             rows, stats = crawl_parallel(
                 root,
@@ -96,6 +112,8 @@ def run_summit_lan_scan(
                 drive_map=drive_map,
                 progress_every=max(1, progress_every),
                 on_progress=on_progress,
+                incremental=use_inc,
+                previous=previous,
             )
         except Exception as exc:  # noqa: BLE001 — keep remaining drives
             print(f"  FAILED {letter}: {exc}", flush=True)
@@ -105,6 +123,7 @@ def run_summit_lan_scan(
         print(
             f"  Crawl {letter}: {len(rows):,} rows  "
             f"files={stats.files_indexed:,} folders={stats.folders_indexed:,} "
+            f"scan={stats.folders_scanned:,} quick={stats.folders_quick:,} "
             f"errors={stats.errors:,} disk~{bytes_to_size_mb(stats.bytes_all_files):,.2f} MB "
             f"in {time.time() - t0:.1f}s",
             flush=True,
@@ -153,6 +172,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Delete existing AccDB files and write a new snapshot",
     )
     parser.add_argument(
+        "--full",
+        action="store_true",
+        help="Re-list every folder (skip quick update)",
+    )
+    parser.add_argument(
         "-w",
         "--workers",
         type=int,
@@ -161,7 +185,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     return run_summit_lan_scan(
-        workers=args.workers, workbook=args.workbook, accdb_fresh=args.fresh
+        workers=args.workers, workbook=args.workbook, accdb_fresh=args.fresh, full_crawl=args.full
     )
 
 
