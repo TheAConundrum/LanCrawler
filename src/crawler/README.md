@@ -16,9 +16,11 @@ LAN crawls are dominated by waiting on directory listings. Multiple workers over
 ## Quick start (easiest in Cursor)
 
 **Run Task:** `Crawl LAN folder (picker)`  
-or `run_crawl.cmd` / `src/crawler/run_crawl.py`
+or double-click `run_crawl.cmd` (folder picker GUI).
 
-A GUI asks for the folder / drive, worker count, and update mode (workbook defaults to `Lan_Search_Tool.xlsm`). A **live progress window** shows folders done, full listings vs quick skips, files, pending, and errors.
+**All mapped drives:** double-click `SummitLANScan.cmd` (same GUI: workers + update mode, then live progress). Each launcher closes its command window as soon as the GUI opens.
+
+A GUI asks for workers and update mode (and a folder for `run_crawl.cmd`; workbook defaults to `Lan_Search_Tool.xlsm`). A **live progress window** shows folders done, full listings vs quick skips, files, pending, and errors.
 
 **Quick update** (default when an AccDB already exists): skip a full `scandir` on folders whose directory timestamp is unchanged. Still re-stats known indexed files (so a resave to a new date is captured) and still walks known subfolders (so a file added in a child folder is captured). Other crawl roots already in the AccDB are kept.
 
@@ -99,7 +101,8 @@ src/crawler/
   filters.py          Allowlist / junk / split volumes
   paths.py            UNC resolve, size helpers
   import_to_excel.py  Sheet import + clear_onboard_tblfiles
-  run_crawl.py        Launcher
+  run_crawl.py        Folder-picker GUI launcher
+  summit_lan_scan.py  All mapped-drives GUI launcher
 
 src/pack_portable.py  Zip colleague kit (pack_portable.cmd)
 ```

@@ -1,15 +1,14 @@
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
 cd /d "%~dp0"
-title LAN Search Tool
 
 set "ROOT=%~dp0"
 set "PORTABLE_VENV=%ROOT%.portable_venv"
 set "DEV_VENV=%ROOT%.venv"
 set "WHEELS=%ROOT%vendor\wheels"
 set "REQ=%ROOT%requirements-crawler.txt"
-set "USED_PORTABLE=0"
 set "PY="
+set "LAN_CRAWL_HIDE_CONSOLE=1"
 
 if exist "%DEV_VENV%\Scripts\python.exe" (
   set "PY=%DEV_VENV%\Scripts\python.exe"
@@ -65,22 +64,14 @@ if not exist "%PORTABLE_VENV%\Scripts\python.exe" (
 )
 
 set "PY=%PORTABLE_VENV%\Scripts\python.exe"
-set "USED_PORTABLE=1"
 
 :run
-"%PY%" "%ROOT%src\crawler\run_crawl.py" %*
-set "ERR=%ERRORLEVEL%"
-
-if "%USED_PORTABLE%"=="1" (
-  echo.
-  set /p DELPKGS=Do you want to delete the temporary python packages? [Y/N] 
-  if /i "!DELPKGS!"=="Y" (
-    echo Removing .portable_venv ...
-    rmdir /s /q "%PORTABLE_VENV%"
-  )
-  echo.
-  pause
+set "PYW="
+for %%I in ("%PY%") do if exist "%%~dpIpythonw.exe" set "PYW=%%~dpIpythonw.exe"
+if defined PYW (
+  start "" "%PYW%" "%ROOT%src\crawler\run_crawl.py" %*
+  exit /b 0
 )
 
-if not "%USED_PORTABLE%"=="1" if not "%ERR%"=="0" pause
-exit /b %ERR%
+"%PY%" "%ROOT%src\crawler\run_crawl.py" %*
+exit /b %ERRORLEVEL%

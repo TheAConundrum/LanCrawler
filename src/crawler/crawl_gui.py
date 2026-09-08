@@ -1,6 +1,7 @@
 """Crawl setup + live progress window."""
 from __future__ import annotations
 
+import os
 import queue
 import threading
 import time
@@ -30,6 +31,40 @@ class CrawlGuiResult:
     accdb_fresh: bool = False
     incremental: bool = True
     cancelled: bool = False
+    scan_all_mapped: bool = False
+
+
+def hide_attached_console() -> None:
+    """Hide the extra cmd window from .cmd launchers (LAN_CRAWL_HIDE_CONSOLE=1)."""
+    if os.name != "nt":
+        return
+    flag = os.environ.get("LAN_CRAWL_HIDE_CONSOLE", "").strip().lower()
+    if flag not in ("1", "true", "yes"):
+        return
+    try:
+        import ctypes
+
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if hwnd:
+            ctypes.windll.user32.ShowWindow(hwnd, 0)
+    except Exception:
+        pass
+
+
+def report_fatal(title: str, message: str) -> None:
+    """Show an error when there is no console (pythonw / hidden cmd)."""
+    hide_attached_console()
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        root.attributes("-topmost", True)
+    except tk.TclError:
+        pass
+    messagebox.showerror(title, message)
+    try:
+        root.destroy()
+    except tk.TclError:
+        pass
 
 
 def _project_root() -> Path:
@@ -53,10 +88,13 @@ def run_crawl_gui(
     *,
     initial_workbook: str | Path | None = None,
     has_existing_index: bool | None = None,
+    summit_drives: list[tuple[str, str, str]] | None = None,
 ) -> CrawlGuiResult:
     """Modal setup dialog. Returns cancelled=True if the user closes without starting."""
+    hide_attached_console()
     root_win = tk.Tk()
-    root_win.title("LAN Search Tool — Crawler")
+    is_summit = summit_drives is not None
+    root_win.title("SummitLANScan — all mapped drives" if is_summit else "LAN Search Tool — Crawler")
     root_win.resizable(False, False)
     try:
         root_win.attributes("-topmost", True)
@@ -105,7 +143,9 @@ def run_crawl_gui(
     def on_start() -> None:
         folder = folder_var.get().strip()
         workbook = workbook_var.get().strip()
-        if not folder:
+        if is_summit:
+            folder = "*"
+        elif not folder:
             messagebox.showwarning("Missing folder", "Select a folder or drive to crawl.")
             return
         if not workbook:
@@ -130,6 +170,7 @@ def run_crawl_gui(
             crawl_mode=mode,
             accdb_fresh=mode == MODE_WIPE,
             incremental=mode == MODE_QUICK,
+            scan_all_mapped=is_summit,
         )
         root_win.destroy()
 
@@ -148,17 +189,30 @@ def run_crawl_gui(
     frm.grid(row=0, column=0, sticky="nsew")
     frm.columnconfigure(0, weight=1)
 
-    ttk.Label(frm, text="Folder / drive to crawl").grid(
-        row=0, column=0, sticky="w", padx=padx, pady=(0, 2)
-    )
-    ttk.Entry(frm, textvariable=folder_var, width=64).grid(
-        row=1, column=0, sticky="ew", padx=padx, pady=pady
-    )
-    ttk.Button(frm, text="Browse…", command=browse_folder).grid(
-        row=1, column=1, padx=padx, pady=pady
-    )
-
-    row = 2
+    row = 0
+    if is_summit:
+        drives = summit_drives or []
+        ttk.Label(frm, text=f"Mapped network drives ({len(drives)})").grid(
+            row=0, column=0, columnspan=2, sticky="w", padx=padx, pady=(0, 2)
+        )
+        drive_lines = "\n".join(
+            f"{letter}  {unc or root}" for letter, root, unc in drives
+        ) or "(none found)"
+        ttk.Label(frm, text=drive_lines, justify="left").grid(
+            row=1, column=0, columnspan=2, sticky="w", padx=padx, pady=pady
+        )
+        row = 2
+    else:
+        ttk.Label(frm, text="Folder / drive to crawl").grid(
+            row=0, column=0, sticky="w", padx=padx, pady=(0, 2)
+        )
+        ttk.Entry(frm, textvariable=folder_var, width=64).grid(
+            row=1, column=0, sticky="ew", padx=padx, pady=pady
+        )
+        ttk.Button(frm, text="Browse…", command=browse_folder).grid(
+            row=1, column=1, padx=padx, pady=pady
+        )
+        row = 2
     if show_workbook:
         ttk.Label(frm, text="Target workbook (.xlsm)").grid(
             row=row, column=0, sticky="w", padx=padx, pady=(8, 2)
@@ -201,13 +255,21 @@ def run_crawl_gui(
     ).grid(row=0, column=0, sticky="w")
     ttk.Radiobutton(
         modes,
-        text="Full recrawl — re-list every folder under this path (other drives kept)",
+        text=(
+            "Full recrawl — re-list every folder on these drives (other roots kept)"
+            if is_summit
+            else "Full recrawl — re-list every folder under this path (other drives kept)"
+        ),
         variable=mode_var,
         value=MODE_FULL,
     ).grid(row=1, column=0, sticky="w")
     ttk.Radiobutton(
         modes,
-        text="Start fresh — erase the entire index, then crawl this folder only",
+        text=(
+            "Start fresh — erase the entire index, then crawl these drives only"
+            if is_summit
+            else "Start fresh — erase the entire index, then crawl this folder only"
+        ),
         variable=mode_var,
         value=MODE_WIPE,
     ).grid(row=2, column=0, sticky="w")
@@ -238,7 +300,11 @@ def run_crawl_gui(
     btn_frm = ttk.Frame(frm)
     btn_frm.grid(row=row, column=0, columnspan=2, sticky="e", padx=padx, pady=pady)
     ttk.Button(btn_frm, text="Cancel", command=on_cancel).pack(side="right", padx=4)
-    ttk.Button(btn_frm, text="Start crawl", command=on_start).pack(side="right", padx=4)
+    ttk.Button(
+        btn_frm,
+        text="Start SummitLANScan" if is_summit else "Start crawl",
+        command=on_start,
+    ).pack(side="right", padx=4)
 
     root_win.protocol("WM_DELETE_WINDOW", on_cancel)
     root_win.mainloop()
@@ -261,6 +327,7 @@ def run_progress_window(
     work(cancel_event, on_stats, on_log)
     Returns False if the user cancelled before completion.
     """
+    hide_attached_console()
     win = tk.Tk()
     win.title("LAN Search Tool — Crawling")
     win.minsize(560, 420)

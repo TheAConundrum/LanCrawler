@@ -73,7 +73,7 @@
                 "showReuseMessage": false,
                 "clear": true
             },
-            "detail": "No picker: crawl every mapped network drive into AccDB (ReplaceRoot per drive)."
+            "detail": "GUI: crawl every mapped network drive into AccDB (ReplaceRoot per drive)."
         },
         {
             "label": "Unlock workbook for layout edit",

@@ -63,13 +63,14 @@ Check your version with:  py --version   or   python --version
 HOW TO RUN
 ----------
 
-1. Unzip the whole folder. Do not move run_crawl.cmd out by itself.
-   Keep it next to Lan_Search_Tool.xlsm, src, and vendor.
+1. Unzip the whole folder. Do not move the .cmd files out by themselves.
+   Keep them next to Lan_Search_Tool.xlsm, src, and vendor.
 
-2. Double-click run_crawl.cmd
+2. Double-click run_crawl.cmd to index one folder or drive.
+   Double-click SummitLANScan.cmd to index every mapped network drive.
    The first run may take a minute while it sets up temporary Python
    packages from the vendor folder (it does not download from the
-   internet).
+   internet). The command window closes when the GUI opens.
 
 3. When the window opens, click Browse and pick the folder or drive
    you want to index. Set workers if you want (16 is the default).
@@ -90,12 +91,9 @@ HOW TO RUN
 5. You can add another folder later by running run_crawl.cmd again
    and choosing Quick update (or Full recrawl).
 
-6. At the end you will be asked:
-
-      Do you want to delete the temporary python packages? [Y/N]
-
-   Y removes the temporary packages so they do not stay on this PC.
-   N keeps them so the next crawl starts faster.
+6. The command window closes as soon as the GUI opens. Temporary
+   Python packages stay in .portable_venv so the next crawl is fast.
+   Delete that folder yourself if you want them gone.
 
 7. Open Lan_Search_Tool.xlsm in Excel to search. Close Excel before
    you crawl again if the database is in use.
@@ -226,6 +224,9 @@ def pack() -> Path:
 
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         zf.write(PROJECT_ROOT / "run_crawl.cmd", f"{ZIP_ROOT}/run_crawl.cmd")
+        summit_cmd = PROJECT_ROOT / "SummitLANScan.cmd"
+        if summit_cmd.is_file():
+            zf.write(summit_cmd, f"{ZIP_ROOT}/SummitLANScan.cmd")
         zf.write(REQ, f"{ZIP_ROOT}/requirements-crawler.txt")
         zf.write(WORKBOOK, f"{ZIP_ROOT}/Lan_Search_Tool.xlsm")
         zf.writestr(f"{ZIP_ROOT}/ReadMe.txt", _readme_txt())

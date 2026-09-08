@@ -1522,7 +1522,13 @@ def run_interactive(
     except Exception:
         pass
 
-    print("LAN Search Tool - parallel crawler", flush=True)
+    def say(msg: str) -> None:
+        if not live_gui:
+            print(msg, flush=True)
+
+    live_gui = False
+    if not use_gui:
+        say("LAN Search Tool - parallel crawler")
 
     root = ""
     wb_path: Path | None = None
@@ -1531,7 +1537,6 @@ def run_interactive(
         mode = "AccDB"
     want_fresh = bool(accdb_fresh)
     want_incremental = bool(incremental) and not full_crawl and not want_fresh
-    live_gui = False
     workers = max(1, min(48, int(workers)))
 
     if use_gui and workbook is None and target_mode is None:
@@ -1542,7 +1547,6 @@ def run_interactive(
 
         gui = run_crawl_gui(initial_workbook=workbook)
         if gui.cancelled:
-            print("Cancelled.", flush=True)
             return 0
         root = gui.root
         wb_path = Path(gui.workbook)
@@ -1579,15 +1583,26 @@ def run_interactive(
             wb_path = None
 
     if wb_path is not None and not wb_path.is_file():
-        print(f"Workbook not found: {wb_path}", flush=True)
+        msg = f"Workbook not found: {wb_path}"
+        if live_gui:
+            from crawler.crawl_gui import report_fatal
+
+            report_fatal("LAN Search Tool", msg)
+        else:
+            print(msg, flush=True)
         return 1
 
     if want_fresh and wb_path is not None:
-        print("Starting fresh: deleting existing AccDB files in DB\\ ...", flush=True)
+        say("Starting fresh: deleting existing AccDB files in DB\\ ...")
         try:
             purge_workbook_accdbs(wb_path)
         except RuntimeError as exc:
-            print(str(exc), flush=True)
+            if live_gui:
+                from crawler.crawl_gui import report_fatal
+
+                report_fatal("LAN Search Tool", str(exc))
+            else:
+                print(str(exc), flush=True)
             return 1
 
     accdb_out = accdb_path_for_workbook(wb_path) if wb_path is not None else None
@@ -1599,16 +1614,16 @@ def run_interactive(
         if want_fresh
         else ("Quick update" if want_incremental else "Full recrawl")
     )
-    print(f"Root:    {root}", flush=True)
-    print(f"UNC:     {unc}", flush=True)
-    print(f"Workers: {workers}", flush=True)
-    print(f"Crawl:   {crawl_mode_label}", flush=True)
-    print(f"Mode:    {mode}", flush=True)
+    say(f"Root:    {root}")
+    say(f"UNC:     {unc}")
+    say(f"Workers: {workers}")
+    say(f"Crawl:   {crawl_mode_label}")
+    say(f"Mode:    {mode}")
     if wb_path is not None:
-        print(f"Excel:   {wb_path}", flush=True)
+        say(f"Excel:   {wb_path}")
     if accdb_out is not None:
-        print(f"AccDB:   {accdb_out}", flush=True)
-    print("---", flush=True)
+        say(f"AccDB:   {accdb_out}")
+    say("---")
 
     job: dict[str, object] = {"rows": None, "stats": None, "error": None}
 
@@ -1618,7 +1633,8 @@ def run_interactive(
         on_log: ProgressCb | None,
     ) -> None:
         def emit(msg: str) -> None:
-            print(msg, flush=True)
+            if not live_gui:
+                print(msg, flush=True)
             if on_log:
                 on_log(msg)
 
@@ -1754,7 +1770,9 @@ def run_interactive(
         if not ok:
             return 1
         if err:
-            print(f"Index write failed: {err}", flush=True)
+            from crawler.crawl_gui import report_fatal
+
+            report_fatal("LAN Search Tool", f"Index write failed: {err}")
             return 1
         return 0
 
@@ -1777,6 +1795,11 @@ if __name__ == "__main__":
     except Exception as exc:  # noqa: BLE001
         import traceback
 
-        print("CRASH:", exc, flush=True)
-        traceback.print_exc()
+        try:
+            from crawler.crawl_gui import report_fatal
+
+            report_fatal("LAN Search Tool", f"{exc}")
+        except Exception:
+            print("CRASH:", exc, flush=True)
+            traceback.print_exc()
         raise SystemExit(1) from exc
