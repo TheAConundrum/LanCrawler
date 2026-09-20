@@ -29,6 +29,11 @@ ACCDB_FILE_NAME_LEGACY = "LAN_Search_Index.accdb"
 ACCDB_FILE_NAME = ACCDB_FILE_NAME_LEGACY  # kept for import compatibility; dated names are preferred
 DEFAULT_WORKBOOK_NAME = "Lan_Search_Tool.xlsm"
 ACCDB_ROW_THRESHOLD = 750_000
+# ACE default MaxLocksPerFile is 9500. One DELETE/INSERT of a LAN root exceeds it.
+ACCDB_WRITE_BATCH = 250
+ACCDB_DELETE_CHUNK = 400
+_DAO_DB_MAX_LOCKS_PER_FILE = 8
+_ACE_MAX_LOCKS_PER_FILE = 200_000
 
 try:
     from .filters import (
@@ -721,6 +726,7 @@ def purge_workbook_accdbs(workbook: str | Path) -> None:
 
 def _create_empty_accdb(out_path: Path) -> None:
     """Create a blank .accdb via ACE/ADOX (pyodbc cannot create empty AccDB files)."""
+    _raise_ace_max_locks()
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     if out_path.exists():
@@ -993,7 +999,169 @@ def _accdb_table_exists(cur, table_name: str) -> bool:
         return False
 
 
-def _ensure_accdb_tables(cur, conn) -> None:
+def _is_ace_lock_count_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return (
+        "maxlocksperfile" in text
+        or "lock count exceeded" in text
+        or "(-1033)" in text
+    )
+
+
+def _safe_rollback(conn) -> None:
+    try:
+        conn.rollback()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _raise_ace_max_locks(max_locks: int = _ACE_MAX_LOCKS_PER_FILE) -> None:
+    """Override ACE MaxLocksPerFile in-process (no registry write)."""
+    try:
+        import win32com.client  # type: ignore
+    except ImportError:
+        return
+    for progid in ("DAO.DBEngine.120", "DAO.DBEngine.160", "DAO.DBEngine.36"):
+        try:
+            win32com.client.Dispatch(progid).SetOption(
+                _DAO_DB_MAX_LOCKS_PER_FILE, int(max_locks)
+            )
+            return
+        except Exception:  # noqa: BLE001
+            continue
+
+
+def _drop_accdb_index(cur, conn, index_name: str, table_name: str) -> None:
+    try:
+        cur.execute(f"DROP INDEX [{index_name}] ON [{table_name}]")
+        conn.commit()
+    except Exception:  # noqa: BLE001
+        _safe_rollback(conn)
+
+
+def _create_accdb_index(cur, conn, index_name: str, table_name: str, column: str) -> None:
+    try:
+        cur.execute(f"CREATE INDEX [{index_name}] ON [{table_name}] ([{column}])")
+        conn.commit()
+    except Exception:  # noqa: BLE001
+        _safe_rollback(conn)
+
+
+def _drop_accdb_bulk_indexes(cur, conn) -> None:
+    _drop_accdb_index(cur, conn, "ix_tblFiles_path", "tblFiles")
+    _drop_accdb_index(cur, conn, "ix_tblFiles_type", "tblFiles")
+    _drop_accdb_index(cur, conn, "ix_tblFolderMeta_path", "tblFolderMeta")
+
+
+def _ensure_accdb_indexes(cur, conn) -> None:
+    if _accdb_table_exists(cur, "tblFiles"):
+        _create_accdb_index(cur, conn, "ix_tblFiles_path", "tblFiles", "FilePath")
+        _create_accdb_index(cur, conn, "ix_tblFiles_type", "tblFiles", "EntryType")
+    if _accdb_table_exists(cur, "tblFolderMeta"):
+        _create_accdb_index(
+            cur, conn, "ix_tblFolderMeta_path", "tblFolderMeta", "FolderPath"
+        )
+
+
+def _drop_accdb_table(cur, conn, table_name: str) -> None:
+    try:
+        cur.execute(f"DROP TABLE [{table_name}]")
+        conn.commit()
+    except Exception:  # noqa: BLE001
+        _safe_rollback(conn)
+
+
+def _executemany_committed(
+    cur,
+    conn,
+    sql: str,
+    records: list[tuple[Any, ...]],
+    *,
+    batch_size: int = ACCDB_WRITE_BATCH,
+) -> None:
+    """Insert in small committed batches; shrink the batch if ACE lock count trips."""
+    if not records:
+        return
+    size = max(1, int(batch_size))
+    i = 0
+    n = len(records)
+    while i < n:
+        chunk = records[i : i + size]
+        try:
+            cur.executemany(sql, chunk)
+            conn.commit()
+            i += len(chunk)
+        except Exception as exc:  # noqa: BLE001
+            _safe_rollback(conn)
+            if _is_ace_lock_count_error(exc) and size > 1:
+                size = max(1, size // 2)
+                continue
+            raise
+
+
+def _chunked_delete_by_paths(
+    cur,
+    conn,
+    *,
+    table_name: str,
+    path_col: str,
+    paths: list[Any],
+) -> None:
+    if not paths:
+        return
+    placeholders = ",".join("?" * len(paths))
+    cur.execute(
+        f"DELETE FROM [{table_name}] WHERE [{path_col}] IN ({placeholders})",
+        paths,
+    )
+    conn.commit()
+
+
+def _chunked_delete_under_root(
+    cur,
+    conn,
+    *,
+    table_name: str,
+    path_col: str,
+    root: str,
+    chunk: int = ACCDB_DELETE_CHUNK,
+) -> int:
+    """Delete matching rows in chunks so ACE stays under MaxLocksPerFile."""
+    if not _accdb_table_exists(cur, table_name):
+        return 0
+    root = strip_trailing_slash(root)
+    if not root:
+        return 0
+    root_u, prefix_len, prefix_u = _under_root_params(root)
+    params = (root_u, prefix_len, prefix_u)
+    chunk_size = max(1, int(chunk))
+    deleted = 0
+    while True:
+        select_sql = (
+            f"SELECT TOP {chunk_size} [{path_col}] FROM [{table_name}] "
+            f"WHERE UCase([{path_col}])=? OR Left(UCase([{path_col}]),?)=?"
+        )
+        cur.execute(select_sql, params)
+        paths = [row[0] for row in cur.fetchall() if row and row[0] is not None]
+        if not paths:
+            return deleted
+        try:
+            _chunked_delete_by_paths(
+                cur, conn, table_name=table_name, path_col=path_col, paths=paths
+            )
+        except Exception as exc:  # noqa: BLE001
+            _safe_rollback(conn)
+            if not _is_ace_lock_count_error(exc) or chunk_size <= 1:
+                raise
+            chunk_size = max(1, chunk_size // 2)
+            continue
+        deleted += len(paths)
+        if len(paths) < chunk_size:
+            return deleted
+    return deleted
+
+
+def _ensure_accdb_tables(cur, conn, *, with_indexes: bool = True) -> None:
     if not _accdb_table_exists(cur, "tblFiles"):
         cur.execute(
             """
@@ -1006,12 +1174,6 @@ def _ensure_accdb_tables(cur, conn) -> None:
             """
         )
         conn.commit()
-        try:
-            cur.execute("CREATE INDEX ix_tblFiles_path ON tblFiles (FilePath)")
-            cur.execute("CREATE INDEX ix_tblFiles_type ON tblFiles (EntryType)")
-            conn.commit()
-        except Exception:  # noqa: BLE001
-            conn.rollback()
 
     if not _accdb_table_exists(cur, "tblFolderMeta"):
         cur.execute(
@@ -1025,11 +1187,6 @@ def _ensure_accdb_tables(cur, conn) -> None:
             """
         )
         conn.commit()
-        try:
-            cur.execute("CREATE INDEX ix_tblFolderMeta_path ON tblFolderMeta (FolderPath)")
-            conn.commit()
-        except Exception:  # noqa: BLE001
-            conn.rollback()
 
     if not _accdb_table_exists(cur, "tblIngested"):
         cur.execute(
@@ -1045,9 +1202,13 @@ def _ensure_accdb_tables(cur, conn) -> None:
         )
         conn.commit()
 
+    if with_indexes:
+        _ensure_accdb_indexes(cur, conn)
+
 
 def _open_accdb(out_path: Path) -> Any:
     """Open AccDB via pyodbc, else ACE OLEDB. Caller must close."""
+    _raise_ace_max_locks()
     try:
         import pyodbc  # type: ignore
     except ImportError as exc:
@@ -1058,7 +1219,10 @@ def _open_accdb(out_path: Path) -> Any:
     last_err: Exception | None = None
     for conn_str in _accdb_connection_strings(out_path):
         try:
-            return pyodbc.connect(conn_str, autocommit=False)
+            conn: Any = pyodbc.connect(conn_str, autocommit=False)
+            if hasattr(conn, "fast_executemany"):
+                conn.fast_executemany = False
+            return conn
         except Exception as exc:  # noqa: BLE001
             last_err = exc
     ado = _open_accdb_ado(out_path)
@@ -1147,16 +1311,13 @@ def load_previous_index(accdb_path: str | Path, crawl_root: str) -> PreviousInde
         conn.close()
 
 
-def _delete_folder_meta_under_root(cur, root: str) -> None:
-    if not _accdb_table_exists(cur, "tblFolderMeta"):
-        return
-    root = strip_trailing_slash(root)
-    if not root:
-        return
-    root_u, prefix_len, prefix_u = _under_root_params(root)
-    cur.execute(
-        "DELETE FROM tblFolderMeta WHERE UCase(FolderPath)=? OR Left(UCase(FolderPath),?)=?",
-        (root_u, prefix_len, prefix_u),
+def _delete_folder_meta_under_root(cur, conn, root: str) -> int:
+    return _chunked_delete_under_root(
+        cur,
+        conn,
+        table_name="tblFolderMeta",
+        path_col="FolderPath",
+        root=root,
     )
 
 
@@ -1168,24 +1329,16 @@ def _insert_folder_meta_rows(cur, conn, rows: list[IndexRow]) -> None:
         "INSERT INTO tblFolderMeta (FolderPath, DirMtime, LocalBytes, CreatedDate) "
         "VALUES (?, ?, ?, ?)"
     )
-    batch: list[tuple[str, float, float, str | None]] = []
-    batch_size = 2000
-    for r in folders:
-        batch.append(
-            (
-                strip_trailing_slash(r.path),
-                float(r.mtime_ts or 0.0),
-                float(r.size_bytes or 0),
-                r.file_date or None,
-            )
+    records: list[tuple[Any, ...]] = [
+        (
+            strip_trailing_slash(r.path),
+            float(r.mtime_ts or 0.0),
+            float(r.size_bytes or 0),
+            r.file_date or None,
         )
-        if len(batch) >= batch_size:
-            cur.executemany(insert_sql, batch)
-            conn.commit()
-            batch.clear()
-    if batch:
-        cur.executemany(insert_sql, batch)
-        conn.commit()
+        for r in folders
+    ]
+    _executemany_committed(cur, conn, insert_sql, records)
 
 
 def _read_accdb_ingest_log(cur) -> list[IngestLogRow]:
@@ -1231,19 +1384,15 @@ def _read_accdb_ingest_log(cur) -> list[IngestLogRow]:
     return rows
 
 
-def _delete_accdb_files_under_root(cur, root: str) -> int:
+def _delete_accdb_files_under_root(cur, conn, root: str) -> int:
     """Delete tblFiles rows for this root (exact + descendants). Returns deleted estimate."""
-    root = strip_trailing_slash(root)
-    if not root:
-        return 0
-    prefix = root + "\\"
-    root_u = root.upper()
-    prefix_u = prefix.upper()
-    cur.execute(
-        "DELETE FROM tblFiles WHERE UCase(FilePath)=? OR Left(UCase(FilePath),?)=?",
-        (root_u, len(prefix_u), prefix_u),
+    return _chunked_delete_under_root(
+        cur,
+        conn,
+        table_name="tblFiles",
+        path_col="FilePath",
+        root=root,
     )
-    return cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0
 
 
 def _rewrite_accdb_ingest_log(cur, conn, log_rows: list[IngestLogRow]) -> None:
@@ -1292,17 +1441,10 @@ def _insert_accdb_file_rows(cur, conn, rows: list[IndexRow]) -> None:
     insert_sql = (
         "INSERT INTO tblFiles (FilePath, FileDate, SizeMB, EntryType) VALUES (?, ?, ?, ?)"
     )
-    batch: list[tuple[str, str | None, float, str]] = []
-    batch_size = 2000
-    for r in rows:
-        batch.append((r.path, r.file_date or None, float(r.size_mb), r.entry_type))
-        if len(batch) >= batch_size:
-            cur.executemany(insert_sql, batch)
-            conn.commit()
-            batch.clear()
-    if batch:
-        cur.executemany(insert_sql, batch)
-        conn.commit()
+    records: list[tuple[Any, ...]] = [
+        (r.path, r.file_date or None, float(r.size_mb), r.entry_type) for r in rows
+    ]
+    _executemany_committed(cur, conn, insert_sql, records)
 
 
 def write_accdb(
@@ -1341,22 +1483,16 @@ def write_accdb(
     conn = _open_accdb(out_path)
     try:
         cur = conn.cursor()
-        _ensure_accdb_tables(cur, conn)
+        _ensure_accdb_tables(cur, conn, with_indexes=False)
 
         existing_log = _read_accdb_ingest_log(cur) if not created_new else []
+        _drop_accdb_bulk_indexes(cur, conn)
 
         full_rebuild = created_new or (not replace_root) or (not root)
         if full_rebuild:
-            try:
-                cur.execute("DELETE FROM tblFiles")
-                conn.commit()
-            except Exception:  # noqa: BLE001
-                conn.rollback()
-            try:
-                cur.execute("DELETE FROM tblFolderMeta")
-                conn.commit()
-            except Exception:  # noqa: BLE001
-                conn.rollback()
+            _drop_accdb_table(cur, conn, "tblFiles")
+            _drop_accdb_table(cur, conn, "tblFolderMeta")
+            _ensure_accdb_tables(cur, conn, with_indexes=False)
             _insert_accdb_file_rows(cur, conn, rows)
             _insert_folder_meta_rows(cur, conn, rows)
             if ingest_log is not None:
@@ -1368,6 +1504,7 @@ def write_accdb(
             else:
                 log_rows = []
             _rewrite_accdb_ingest_log(cur, conn, log_rows)
+            _ensure_accdb_indexes(cur, conn)
             print(
                 f"AccDB full write: files={len(rows):,} ingest_scans={len(log_rows)}",
                 flush=True,
@@ -1375,9 +1512,8 @@ def write_accdb(
             return
 
         # ReplaceRoot merge: keep other roots, replace this root's files + ingest row
-        deleted = _delete_accdb_files_under_root(cur, root)
-        _delete_folder_meta_under_root(cur, root)
-        conn.commit()
+        deleted = _delete_accdb_files_under_root(cur, conn, root)
+        _delete_folder_meta_under_root(cur, conn, root)
         _insert_accdb_file_rows(cur, conn, rows)
         _insert_folder_meta_rows(cur, conn, rows)
         assert new_ingest is not None
@@ -1388,6 +1524,7 @@ def write_accdb(
         else:
             log_rows = _merge_ingest_log(existing_log, new_ingest)
         _rewrite_accdb_ingest_log(cur, conn, log_rows)
+        _ensure_accdb_indexes(cur, conn)
         print(
             f"AccDB ReplaceRoot: removed~{deleted} prior rows under {root}; "
             f"ingest scans now={len(log_rows)}",
