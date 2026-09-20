@@ -276,7 +276,8 @@ def run_crawl_gui(
     if not existing:
         mode_var.set(MODE_FULL)
         for child in modes.winfo_children()[:1]:
-            child.configure(state="disabled")
+            if isinstance(child, ttk.Radiobutton):
+                child.state(["disabled"])
         ttk.Label(
             frm,
             text="No existing AccDB yet — first crawl is always a full listing.",

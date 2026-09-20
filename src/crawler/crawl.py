@@ -1044,6 +1044,9 @@ def _ensure_accdb_tables(cur, conn) -> None:
             """
         )
         conn.commit()
+
+
+def _open_accdb(out_path: Path) -> Any:
     """Open AccDB via pyodbc, else ACE OLEDB. Caller must close."""
     try:
         import pyodbc  # type: ignore

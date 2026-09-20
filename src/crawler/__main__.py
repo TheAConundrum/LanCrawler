@@ -132,10 +132,11 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:  # noqa: BLE001
             print(f"Could not load previous index ({exc}); full listing.", flush=True)
             previous = None
-        use_inc = bool(previous is not None and previous.has_meta)
-        if use_inc:
+        if previous is not None and previous.has_meta:
+            use_inc = True
             print(f"Quick update: {len(previous.folders):,} folders with timestamps.", flush=True)
         else:
+            use_inc = False
             print("No folder timestamps yet — full listing this run.", flush=True)
 
     t0 = time.time()

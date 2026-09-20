@@ -17,12 +17,15 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from crawler.crawl import (  # noqa: E402
+    ProgressCb,
+    StatsCb,
     accdb_path_for_workbook,
     crawl_parallel,
     load_previous_index,
     purge_workbook_accdbs,
     write_accdb,
 )
+from crawler.index_state import PreviousIndex  # noqa: E402
 from crawler.paths import (  # noqa: E402
     build_drive_map,
     bytes_to_size_mb,
@@ -130,12 +133,12 @@ def run_summit_lan_scan(
 
     def run_job(
         cancel_event: threading.Event | None,
-        on_stats: object,
-        on_log: object,
+        on_stats: StatsCb | None,
+        on_log: ProgressCb | None,
     ) -> None:
         def emit(msg: str) -> None:
             say(msg)
-            if callable(on_log):
+            if on_log is not None:
                 on_log(msg)
 
         t_all = time.time()
@@ -152,7 +155,7 @@ def run_summit_lan_scan(
             emit(f"  UNC: {unc}")
 
             t0 = time.time()
-            previous = None
+            previous: PreviousIndex | None = None
             use_inc = want_incremental
             if use_inc and accdb_out.is_file():
                 try:
@@ -160,10 +163,11 @@ def run_summit_lan_scan(
                 except Exception as exc:  # noqa: BLE001
                     emit(f"  (previous index skipped: {exc})")
                     previous = None
-                use_inc = bool(previous is not None and previous.has_meta)
-                if use_inc:
+                if previous is not None and previous.has_meta:
+                    use_inc = True
                     emit(f"  Quick update: {len(previous.folders):,} known folders")
                 else:
+                    use_inc = False
                     emit("  No folder timestamps yet — full listing this drive")
             try:
                 rows, stats = crawl_parallel(
@@ -172,7 +176,7 @@ def run_summit_lan_scan(
                     drive_map=drive_map,
                     progress_every=max(1, progress_every),
                     on_progress=emit,
-                    on_stats=on_stats if callable(on_stats) else None,
+                    on_stats=on_stats,
                     incremental=use_inc,
                     previous=previous,
                     cancel_event=cancel_event,
