@@ -13,6 +13,7 @@ if str(_SRC) not in sys.path:
 from crawler.crawl import (  # noqa: E402
     IndexRow,
     _chunked_delete_under_root,
+    _delete_under_root,
     _executemany_committed,
     _is_ace_lock_count_error,
     _raise_ace_max_locks,
@@ -121,6 +122,47 @@ class AccdbLockHelperTests(unittest.TestCase):
 
     def test_raise_max_locks_does_not_crash(self) -> None:
         _raise_ace_max_locks()
+
+    def test_delete_prefers_one_shot(self) -> None:
+        class _OneShotCursor:
+            def __init__(self) -> None:
+                self.sqls: list[str] = []
+                self.rowcount = -1
+                self._rows: list[tuple[object, ...]] = [("x",)]
+
+            def execute(
+                self, sql: str, params: tuple[object, ...] | list[object] | None = None
+            ) -> None:
+                self.sqls.append(sql.strip())
+                sql_u = sql.strip().upper()
+                if sql_u.startswith("SELECT TOP 1 *"):
+                    self._rows = [("x",)]
+                    return
+                if sql_u.startswith("DELETE") and " IN (" not in sql_u:
+                    self.rowcount = 42
+                    self._rows = []
+                    return
+                raise AssertionError(f"unexpected SQL: {sql}")
+
+            def fetchall(self) -> list[tuple[object, ...]]:
+                return list(self._rows)
+
+            def fetchone(self) -> tuple[object, ...] | None:
+                return self._rows[0] if self._rows else None
+
+        cur = _OneShotCursor()
+        conn = _LockConn()
+        deleted = _delete_under_root(
+            cur,
+            conn,
+            table_name="tblFiles",
+            path_col="FilePath",
+            root=r"\\server\share",
+        )
+        self.assertEqual(deleted, 42)
+        self.assertTrue(any(s.upper().startswith("DELETE FROM") for s in cur.sqls))
+        self.assertFalse(any("SELECT TOP 4000" in s.upper() for s in cur.sqls))
+        self.assertFalse(any("SELECT TOP 400 " in s.upper() for s in cur.sqls))
 
 
 class AccdbWriteIntegrationTests(unittest.TestCase):

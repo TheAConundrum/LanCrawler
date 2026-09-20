@@ -29,9 +29,10 @@ ACCDB_FILE_NAME_LEGACY = "LAN_Search_Index.accdb"
 ACCDB_FILE_NAME = ACCDB_FILE_NAME_LEGACY  # kept for import compatibility; dated names are preferred
 DEFAULT_WORKBOOK_NAME = "Lan_Search_Tool.xlsm"
 ACCDB_ROW_THRESHOLD = 750_000
-# ACE default MaxLocksPerFile is 9500. One DELETE/INSERT of a LAN root exceeds it.
-ACCDB_WRITE_BATCH = 250
-ACCDB_DELETE_CHUNK = 400
+# Prefer August-era bulk writes. ACE default MaxLocksPerFile is 9500; we raise it
+# in-process and only shrink batches if a lock-count error still fires.
+ACCDB_WRITE_BATCH = 2000
+ACCDB_DELETE_CHUNK = 4000
 _DAO_DB_MAX_LOCKS_PER_FILE = 8
 _ACE_MAX_LOCKS_PER_FILE = 200_000
 
@@ -1031,26 +1032,12 @@ def _raise_ace_max_locks(max_locks: int = _ACE_MAX_LOCKS_PER_FILE) -> None:
             continue
 
 
-def _drop_accdb_index(cur, conn, index_name: str, table_name: str) -> None:
-    try:
-        cur.execute(f"DROP INDEX [{index_name}] ON [{table_name}]")
-        conn.commit()
-    except Exception:  # noqa: BLE001
-        _safe_rollback(conn)
-
-
 def _create_accdb_index(cur, conn, index_name: str, table_name: str, column: str) -> None:
     try:
         cur.execute(f"CREATE INDEX [{index_name}] ON [{table_name}] ([{column}])")
         conn.commit()
     except Exception:  # noqa: BLE001
         _safe_rollback(conn)
-
-
-def _drop_accdb_bulk_indexes(cur, conn) -> None:
-    _drop_accdb_index(cur, conn, "ix_tblFiles_path", "tblFiles")
-    _drop_accdb_index(cur, conn, "ix_tblFiles_type", "tblFiles")
-    _drop_accdb_index(cur, conn, "ix_tblFolderMeta_path", "tblFolderMeta")
 
 
 def _ensure_accdb_indexes(cur, conn) -> None:
@@ -1078,23 +1065,32 @@ def _executemany_committed(
     records: list[tuple[Any, ...]],
     *,
     batch_size: int = ACCDB_WRITE_BATCH,
+    on_progress: ProgressCb | None = None,
 ) -> None:
-    """Insert in small committed batches; shrink the batch if ACE lock count trips."""
+    """Bulk insert; shrink the batch only if ACE lock count trips."""
     if not records:
         return
     size = max(1, int(batch_size))
     i = 0
     n = len(records)
+    last_note = 0
     while i < n:
         chunk = records[i : i + size]
         try:
             cur.executemany(sql, chunk)
             conn.commit()
             i += len(chunk)
+            if on_progress is not None and (i == n or i - last_note >= max(size * 5, 1)):
+                on_progress(f"    AccDB inserted {i:,} / {n:,}")
+                last_note = i
         except Exception as exc:  # noqa: BLE001
             _safe_rollback(conn)
             if _is_ace_lock_count_error(exc) and size > 1:
                 size = max(1, size // 2)
+                if on_progress is not None:
+                    on_progress(
+                        f"    AccDB lock limit — retrying inserts in batches of {size:,}"
+                    )
                 continue
             raise
 
@@ -1159,6 +1155,61 @@ def _chunked_delete_under_root(
         if len(paths) < chunk_size:
             return deleted
     return deleted
+
+
+def _one_shot_delete_under_root(
+    cur,
+    conn,
+    *,
+    table_name: str,
+    path_col: str,
+    root: str,
+) -> int:
+    root_u, prefix_len, prefix_u = _under_root_params(root)
+    cur.execute(
+        f"DELETE FROM [{table_name}] WHERE UCase([{path_col}])=? OR Left(UCase([{path_col}]),?)=?",
+        (root_u, prefix_len, prefix_u),
+    )
+    deleted = cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0
+    conn.commit()
+    return deleted
+
+
+def _delete_under_root(
+    cur,
+    conn,
+    *,
+    table_name: str,
+    path_col: str,
+    root: str,
+    on_progress: ProgressCb | None = None,
+) -> int:
+    """One-shot DELETE like August builds; chunk only if ACE lock count trips."""
+    if not _accdb_table_exists(cur, table_name):
+        return 0
+    root = strip_trailing_slash(root)
+    if not root:
+        return 0
+    try:
+        return _one_shot_delete_under_root(
+            cur, conn, table_name=table_name, path_col=path_col, root=root
+        )
+    except Exception as exc:  # noqa: BLE001
+        _safe_rollback(conn)
+        if not _is_ace_lock_count_error(exc):
+            raise
+        if on_progress is not None:
+            on_progress(
+                f"    AccDB lock limit — deleting {table_name} in chunks of "
+                f"{ACCDB_DELETE_CHUNK:,}"
+            )
+        return _chunked_delete_under_root(
+            cur,
+            conn,
+            table_name=table_name,
+            path_col=path_col,
+            root=root,
+        )
 
 
 def _ensure_accdb_tables(cur, conn, *, with_indexes: bool = True) -> None:
@@ -1311,17 +1362,22 @@ def load_previous_index(accdb_path: str | Path, crawl_root: str) -> PreviousInde
         conn.close()
 
 
-def _delete_folder_meta_under_root(cur, conn, root: str) -> int:
-    return _chunked_delete_under_root(
+def _delete_folder_meta_under_root(
+    cur, conn, root: str, *, on_progress: ProgressCb | None = None
+) -> int:
+    return _delete_under_root(
         cur,
         conn,
         table_name="tblFolderMeta",
         path_col="FolderPath",
         root=root,
+        on_progress=on_progress,
     )
 
 
-def _insert_folder_meta_rows(cur, conn, rows: list[IndexRow]) -> None:
+def _insert_folder_meta_rows(
+    cur, conn, rows: list[IndexRow], *, on_progress: ProgressCb | None = None
+) -> None:
     folders = [r for r in rows if r.entry_type == ENTRY_FOLDER]
     if not folders:
         return
@@ -1338,7 +1394,7 @@ def _insert_folder_meta_rows(cur, conn, rows: list[IndexRow]) -> None:
         )
         for r in folders
     ]
-    _executemany_committed(cur, conn, insert_sql, records)
+    _executemany_committed(cur, conn, insert_sql, records, on_progress=on_progress)
 
 
 def _read_accdb_ingest_log(cur) -> list[IngestLogRow]:
@@ -1384,14 +1440,17 @@ def _read_accdb_ingest_log(cur) -> list[IngestLogRow]:
     return rows
 
 
-def _delete_accdb_files_under_root(cur, conn, root: str) -> int:
+def _delete_accdb_files_under_root(
+    cur, conn, root: str, *, on_progress: ProgressCb | None = None
+) -> int:
     """Delete tblFiles rows for this root (exact + descendants). Returns deleted estimate."""
-    return _chunked_delete_under_root(
+    return _delete_under_root(
         cur,
         conn,
         table_name="tblFiles",
         path_col="FilePath",
         root=root,
+        on_progress=on_progress,
     )
 
 
@@ -1437,14 +1496,16 @@ def _rewrite_accdb_ingest_log(cur, conn, log_rows: list[IngestLogRow]) -> None:
     conn.commit()
 
 
-def _insert_accdb_file_rows(cur, conn, rows: list[IndexRow]) -> None:
+def _insert_accdb_file_rows(
+    cur, conn, rows: list[IndexRow], *, on_progress: ProgressCb | None = None
+) -> None:
     insert_sql = (
         "INSERT INTO tblFiles (FilePath, FileDate, SizeMB, EntryType) VALUES (?, ?, ?, ?)"
     )
     records: list[tuple[Any, ...]] = [
         (r.path, r.file_date or None, float(r.size_mb), r.entry_type) for r in rows
     ]
-    _executemany_committed(cur, conn, insert_sql, records)
+    _executemany_committed(cur, conn, insert_sql, records, on_progress=on_progress)
 
 
 def write_accdb(
@@ -1454,6 +1515,7 @@ def write_accdb(
     crawl_root: str | None = None,
     ingest_log: list[IngestLogRow] | None = None,
     replace_root: bool = True,
+    on_progress: ProgressCb | None = None,
 ) -> None:
     """
     Write crawl rows into AccDB tblFiles and accumulate scan roots in tblIngested.
@@ -1462,6 +1524,13 @@ def write_accdb(
     this crawl_root (and child ingest entries). Full wipe only when replace_root=False
     or the AccDB file is new.
     """
+
+    def note(msg: str) -> None:
+        if on_progress is not None:
+            on_progress(msg)
+        else:
+            print(msg, flush=True)
+
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1480,21 +1549,22 @@ def write_accdb(
         _create_empty_accdb(out_path)
         created_new = True
 
+    t0 = time.time()
     conn = _open_accdb(out_path)
     try:
         cur = conn.cursor()
-        _ensure_accdb_tables(cur, conn, with_indexes=False)
+        _ensure_accdb_tables(cur, conn)
 
         existing_log = _read_accdb_ingest_log(cur) if not created_new else []
-        _drop_accdb_bulk_indexes(cur, conn)
 
         full_rebuild = created_new or (not replace_root) or (not root)
         if full_rebuild:
+            note(f"  AccDB full write {len(rows):,} rows ...")
             _drop_accdb_table(cur, conn, "tblFiles")
             _drop_accdb_table(cur, conn, "tblFolderMeta")
-            _ensure_accdb_tables(cur, conn, with_indexes=False)
-            _insert_accdb_file_rows(cur, conn, rows)
-            _insert_folder_meta_rows(cur, conn, rows)
+            _ensure_accdb_tables(cur, conn)
+            _insert_accdb_file_rows(cur, conn, rows, on_progress=on_progress)
+            _insert_folder_meta_rows(cur, conn, rows, on_progress=on_progress)
             if ingest_log is not None:
                 log_rows = [
                     r for r in ingest_log if not _is_synthetic_ingest_root(r.root_path)
@@ -1504,18 +1574,20 @@ def write_accdb(
             else:
                 log_rows = []
             _rewrite_accdb_ingest_log(cur, conn, log_rows)
-            _ensure_accdb_indexes(cur, conn)
-            print(
-                f"AccDB full write: files={len(rows):,} ingest_scans={len(log_rows)}",
-                flush=True,
+            note(
+                f"AccDB full write: files={len(rows):,} ingest_scans={len(log_rows)} "
+                f"in {time.time() - t0:.1f}s"
             )
             return
 
         # ReplaceRoot merge: keep other roots, replace this root's files + ingest row
-        deleted = _delete_accdb_files_under_root(cur, conn, root)
-        _delete_folder_meta_under_root(cur, conn, root)
-        _insert_accdb_file_rows(cur, conn, rows)
-        _insert_folder_meta_rows(cur, conn, rows)
+        note(f"  AccDB ReplaceRoot {len(rows):,} rows under {root} ...")
+        deleted = _delete_accdb_files_under_root(
+            cur, conn, root, on_progress=on_progress
+        )
+        _delete_folder_meta_under_root(cur, conn, root, on_progress=on_progress)
+        _insert_accdb_file_rows(cur, conn, rows, on_progress=on_progress)
+        _insert_folder_meta_rows(cur, conn, rows, on_progress=on_progress)
         assert new_ingest is not None
         if ingest_log is not None:
             log_rows = [
@@ -1524,11 +1596,9 @@ def write_accdb(
         else:
             log_rows = _merge_ingest_log(existing_log, new_ingest)
         _rewrite_accdb_ingest_log(cur, conn, log_rows)
-        _ensure_accdb_indexes(cur, conn)
-        print(
+        note(
             f"AccDB ReplaceRoot: removed~{deleted} prior rows under {root}; "
-            f"ingest scans now={len(log_rows)}",
-            flush=True,
+            f"ingest scans now={len(log_rows)} in {time.time() - t0:.1f}s"
         )
     finally:
         conn.close()
@@ -1849,7 +1919,7 @@ def run_interactive(
         if force_accdb:
             assert accdb_out is not None
             emit(f"Writing AccDB -> {accdb_out} ...")
-            write_accdb(rows, accdb_out, crawl_root=unc)
+            write_accdb(rows, accdb_out, crawl_root=unc, on_progress=emit)
             emit(f"Wrote AccDB ({len(rows):,} rows + folder timestamps).")
             try:
                 from .import_to_excel import clear_onboard_tblfiles

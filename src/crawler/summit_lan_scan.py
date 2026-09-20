@@ -199,7 +199,13 @@ def run_summit_lan_scan(
             )
             emit(f"  Writing AccDB ReplaceRoot for {unc} ...")
             try:
-                write_accdb(rows, accdb_out, crawl_root=unc, replace_root=True)
+                write_accdb(
+                    rows,
+                    accdb_out,
+                    crawl_root=unc,
+                    replace_root=True,
+                    on_progress=emit,
+                )
             except Exception as exc:  # noqa: BLE001
                 emit(f"  FAILED AccDB {letter}: {exc}")
                 failed.append(letter)
