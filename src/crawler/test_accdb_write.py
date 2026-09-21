@@ -12,11 +12,15 @@ if str(_SRC) not in sys.path:
 
 from crawler.crawl import (  # noqa: E402
     IndexRow,
+    _ace_schema_col_type,
     _chunked_delete_under_root,
     _delete_under_root,
     _executemany_committed,
+    _insert_accdb_records,
     _is_ace_lock_count_error,
     _raise_ace_max_locks,
+    _write_ace_schema_ini,
+    _write_ace_tab_file,
     write_accdb,
 )
 
@@ -163,6 +167,52 @@ class AccdbLockHelperTests(unittest.TestCase):
         self.assertTrue(any(s.upper().startswith("DELETE FROM") for s in cur.sqls))
         self.assertFalse(any("SELECT TOP 4000" in s.upper() for s in cur.sqls))
         self.assertFalse(any("SELECT TOP 400 " in s.upper() for s in cur.sqls))
+
+
+class AccdbTextImportHelperTests(unittest.TestCase):
+    def test_schema_types(self) -> None:
+        self.assertEqual(_ace_schema_col_type("FilePath"), "Memo")
+        self.assertEqual(_ace_schema_col_type("SizeMB"), "Double")
+        self.assertEqual(_ace_schema_col_type("EntryType"), "Text")
+
+    def test_writes_unicode_tab_file_and_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            folder = Path(raw)
+            path = folder / "load_0000.txt"
+            cols = ["FilePath", "FileDate", "SizeMB", "EntryType"]
+            recs = [(r"\\server\share\a,b.txt", "2026-09-21", 1.5, "FILE")]
+            _write_ace_tab_file(path, cols, recs)
+            _write_ace_schema_ini(folder, path.name, cols)
+            text = path.read_text(encoding="utf-16")
+            self.assertIn("FilePath", text)
+            self.assertIn("a,b.txt", text)
+            ini = (folder / "schema.ini").read_text(encoding="utf-8")
+            self.assertIn("Format=TabDelimited", ini)
+            self.assertIn("Col1=FilePath Memo", ini)
+
+    def test_text_import_failure_falls_back_to_row_inserts(self) -> None:
+        class _Cursor:
+            def __init__(self) -> None:
+                self.inserted = 0
+
+            def execute(self, _sql: str, _params: object = None) -> None:
+                raise Exception("ACE text ISAM not available")
+
+            def executemany(self, _sql: str, chunk: list[tuple[object, ...]]) -> None:
+                self.inserted += len(chunk)
+
+        cur = _Cursor()
+        conn = _LockConn()
+        records = [("p", "2026-01-01", 0.01, "FILE") for _ in range(3)]
+        _insert_accdb_records(
+            cur,
+            conn,
+            table_name="tblFiles",
+            columns=["FilePath", "FileDate", "SizeMB", "EntryType"],
+            records=records,
+            insert_sql="INSERT INTO tblFiles VALUES (?,?,?,?)",
+        )
+        self.assertEqual(cur.inserted, 3)
 
 
 class AccdbWriteIntegrationTests(unittest.TestCase):

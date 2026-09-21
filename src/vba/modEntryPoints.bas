@@ -11,11 +11,11 @@ Option Explicit
 
 ' When True, WarmIndexCache will not re-apply UI lock (layout edit session).
 Public gLayoutEditMode As Boolean
-' Results A:K / P:T merges are unlocked for select+copy; skip the 20k pass until relock.
+' Results AutoFilter/copy stay unlocked; skip extra protect passes until relock.
 Public gResultsCopyUnlockDone As Boolean
 
 ' Dashboard columns that stay fixed width while AllowFormattingColumns is on:
-' A:G, H:J, L:N (session snapshot; K and O+ remain user-resizable).
+' A:G, H:J, L:N (session snapshot; K and P:T remain user-resizable).
 Private mDashFixedW(1 To 14) As Double
 Private mDashFixedWReady As Boolean
 
@@ -158,14 +158,14 @@ Public Function HandleDashboardResultDoubleClick(ByVal Sh As Object, ByVal Targe
     map.Init Sh.Parent
 
     firstData = map.ResultsFirstDataRow
-    lastData = firstData + map.ResultsMaxRows - 1
+    lastData = map.ResultsLastDataRow
     r = Target.Row
     If r < firstData Or r > lastData Then Exit Function
 
     Cancel = True
     HandleDashboardResultDoubleClick = True
 
-    ' Merged File band A:K always reports Column = 1 — do NOT touch MergeArea (1004 when protected)
+    ' File band A:K — value is in A and spills across empty B:K
     topCol = Target.Column
 
     If topCol < map.ResultsFileCol Or topCol > map.ResultsFileColEnd Then

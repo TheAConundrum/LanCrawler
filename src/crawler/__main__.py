@@ -24,6 +24,7 @@ from crawler.crawl import (  # noqa: E402
     accdb_path_for_workbook,
     crawl_parallel,
     purge_workbook_accdbs,
+    skip_log_path_for_accdb,
     write_accdb,
     write_csv,
 )
@@ -139,6 +140,7 @@ def main(argv: list[str] | None = None) -> int:
             use_inc = False
             print("No folder timestamps yet — full listing this run.", flush=True)
 
+    skip_log = skip_log_path_for_accdb(load_from or accdb_path)
     t0 = time.time()
     rows, stats = crawl_parallel(
         args.root,
@@ -149,6 +151,7 @@ def main(argv: list[str] | None = None) -> int:
         on_progress=on_progress,
         incremental=use_inc,
         previous=previous,
+        skip_log_path=skip_log,
     )
 
     if csv_path is not None:
@@ -158,7 +161,11 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"Stats: files={stats.files_indexed:,} folders={stats.folders_indexed:,} "
         f"scan={stats.folders_scanned:,} quick={stats.folders_quick:,} "
-        f"errors={stats.errors:,} disk~{bytes_to_size_mb(stats.bytes_all_files):,.2f} MB "
+        f"errors={stats.errors:,} "
+        f"no_access={stats.skip_no_access:,} "
+        f"network={stats.skip_network:,} "
+        f"recovered={stats.skip_recovered:,} "
+        f"disk~{bytes_to_size_mb(stats.bytes_all_files):,.2f} MB "
         f"crawl={stats.elapsed:.1f}s"
     )
 

@@ -447,21 +447,10 @@ Private Function ParseSizeFilter(ByRef sizeOp As String, ByVal sizeValue As Vari
 End Function
 
 Private Sub ClearResults()
-    Dim ws As Worksheet
-    Dim tbl As ListObject
-
-    Set ws = mMap.Dashboard
-
     mMap.UnprotectDashboard
     mMap.ClearResultsAutoFilter
-
-    On Error Resume Next
-    Set tbl = ws.ListObjects(mMap.TableResultsName)
-    If Not tbl Is Nothing Then tbl.Delete
-    On Error GoTo 0
-
+    mMap.EnsureResultsDisplayGrid
     mMap.ClearResultsValues
-
     mMap.EnsureDashboardChromeMerges
 End Sub
 
@@ -474,6 +463,7 @@ Private Sub WriteResults(ByVal hits As Object)
     Dim dateCol As Long
     Dim driveCol As Long
     Dim folderCol As Long
+    Dim linkCol As Long
     Dim keys As Variant
     Dim i As Long
     Dim n As Long
@@ -490,6 +480,7 @@ Private Sub WriteResults(ByVal hits As Object)
     Dim outDate() As Variant
     Dim outDrive() As Variant
     Dim outFolder() As Variant
+    Dim outLink() As Variant
     Dim prevFolderKey As String
     Dim groupFolderUnc As String
     Dim groupFolderDisplay As String
@@ -499,28 +490,12 @@ Private Sub WriteResults(ByVal hits As Object)
     Dim folderCount As Long
     Dim totalSizeMb As Double
     Dim tPhase As Double
-    Dim outLink() As Variant
-    Dim linkCol As Long
-    Dim sizeRng As Range
-    Dim fileRng As Range
     Dim writeN As Long
     Dim maxRows As Long
+    Dim sizeMb As Double
+    Dim createdOn As Variant
 
     maxRows = mMap.ResultsMaxRows
-
-    Set ws = mMap.Dashboard
-    firstDataRow = mMap.ResultsFirstDataRow
-    fileCol = mMap.ResultsFileCol
-    typeCol = mMap.ResultsTypeCol
-    sizeCol = mMap.ResultsSizeCol
-    dateCol = mMap.ResultsDateCol
-    driveCol = mMap.ResultsDriveCol
-    folderCol = mMap.ResultsFolderCol
-    linkCol = mMap.ResultsLinkCol
-
-    tPhase = Timer
-    mMap.EnsureResultsDisplayGrid
-    Debug.Print "SEARCH: EnsureResultsDisplayGrid=" & FormatSeconds(ElapsedSeconds(tPhase))
 
     tPhase = Timer
     ClearResults
@@ -541,14 +516,13 @@ Private Sub WriteResults(ByVal hits As Object)
         writeN = maxRows
         Debug.Print "SEARCH: truncating display to " & CStr(maxRows) & " of " & CStr(n) & " hits"
     End If
-    Debug.Print "SEARCH: writeN=" & CStr(writeN) & " (prebuilt merges/stripes; values+links only)"
+    Debug.Print "SEARCH: writeN=" & CStr(writeN) & " (File A spills B:K; Folder P spills Q:T)"
 
     tPhase = Timer
     keys = hits.Keys
     ReDim sorted(1 To n)
     ReDim sortKey(1 To n)
     If n = 1 Then
-        ' Scripting.Dictionary.Keys is a scalar for 1 item on some hosts, an array on others
         If IsArray(keys) Then
             sorted(1) = CStr(keys(LBound(keys)))
         Else
@@ -581,6 +555,16 @@ Private Sub WriteResults(ByVal hits As Object)
         uncPath = sorted(i)
         meta = hits(uncPath)
         isFolderHit = (IsArray(meta) And UBound(meta) >= 2 And CBool(meta(2)))
+        sizeMb = 0.01
+        createdOn = Empty
+        If IsArray(meta) Then
+            sizeMb = modPathUtil.CoerceStoredSizeMb(meta(1))
+            If Not IsEmpty(meta(0)) Then
+                On Error Resume Next
+                createdOn = DateValue(CDate(meta(0)))
+                On Error GoTo 0
+            End If
+        End If
 
         If isFolderHit Then
             folderCount = folderCount + 1
@@ -590,26 +574,10 @@ Private Sub WriteResults(ByVal hits As Object)
             displayName = "\" & fileName & "\"
             If i <= writeN Then
                 outFile(i, 1) = displayName
-                outLink(i, 1) = uncPath ' double-click opens this folder
                 outType(i, 1) = fileType
-                outSize(i, 1) = 0.01
-                If IsArray(meta) Then
-                    ' Recursive disk total of all files under this folder (indexed SizeMB).
-                    outSize(i, 1) = modPathUtil.CoerceStoredSizeMb(meta(1))
-                End If
-                outDate(i, 1) = Empty
-                If IsArray(meta) Then
-                    If Not IsEmpty(meta(0)) Then
-                        On Error Resume Next
-                        outDate(i, 1) = DateValue(CDate(meta(0)))
-                        On Error GoTo 0
-                    End If
-                End If
-            End If
-            If IsArray(meta) Then
-                totalSizeMb = totalSizeMb + CDbl(modPathUtil.CoerceStoredSizeMb(meta(1)))
-            Else
-                totalSizeMb = totalSizeMb + 0.01
+                outSize(i, 1) = sizeMb
+                outDate(i, 1) = createdOn
+                outLink(i, 1) = uncPath
             End If
         Else
             fileCount = fileCount + 1
@@ -618,35 +586,22 @@ Private Sub WriteResults(ByVal hits As Object)
             displayName = AppendTypeToFileName(fileName, fileType)
             groupFolderUnc = modPathUtil.ParentFolderPath(uncPath)
             If Right$(groupFolderUnc, 1) = "\" Then groupFolderUnc = Left$(groupFolderUnc, Len(groupFolderUnc) - 1)
-
             If i <= writeN Then
                 outFile(i, 1) = displayName
-                outLink(i, 1) = groupFolderUnc ' double-click opens containing folder
                 outType(i, 1) = fileType
-                outSize(i, 1) = 0.01
-                outDate(i, 1) = Empty
-                If IsArray(meta) Then
-                    outSize(i, 1) = modPathUtil.CoerceStoredSizeMb(meta(1))
-                    If Not IsEmpty(meta(0)) Then
-                        On Error Resume Next
-                        outDate(i, 1) = DateValue(CDate(meta(0)))
-                        On Error GoTo 0
-                    End If
-                End If
-            End If
-            If IsArray(meta) Then
-                totalSizeMb = totalSizeMb + CDbl(modPathUtil.CoerceStoredSizeMb(meta(1)))
-            Else
-                totalSizeMb = totalSizeMb + 0.01
+                outSize(i, 1) = sizeMb
+                outDate(i, 1) = createdOn
+                outLink(i, 1) = groupFolderUnc
             End If
         End If
+
+        totalSizeMb = totalSizeMb + CDbl(sizeMb)
 
         If i <= writeN Then
             If StrComp(groupFolderUnc, prevFolderKey, vbTextCompare) = 0 Then
                 outDrive(i, 1) = Empty
                 outFolder(i, 1) = Empty
             Else
-                ' Resolve drive label only when the folder group changes (was per-row Shell/WNet)
                 groupDrive = modIndexCache.FriendlyLabelForShare(groupFolderUnc)
                 groupFolderDisplay = modPathUtil.ToDisplayPath(groupFolderUnc)
                 If isFolderHit Then
@@ -660,32 +615,27 @@ Private Sub WriteResults(ByVal hits As Object)
     Next i
     Debug.Print "SEARCH: build output arrays=" & FormatSeconds(ElapsedSeconds(tPhase))
 
+    Set ws = mMap.Dashboard
+    firstDataRow = mMap.ResultsFirstDataRow
+    fileCol = mMap.ResultsFileCol
+    typeCol = mMap.ResultsTypeCol
+    sizeCol = mMap.ResultsSizeCol
+    dateCol = mMap.ResultsDateCol
+    driveCol = mMap.ResultsDriveCol
+    folderCol = mMap.ResultsFolderCol
+    linkCol = mMap.ResultsLinkCol
+
     tPhase = Timer
-    ' Batch dump only — no Hyperlinks.Add (double-click opens folder via hidden UNC col)
-    Set sizeRng = ws.Range(ws.Cells(firstDataRow, sizeCol), ws.Cells(firstDataRow + writeN - 1, sizeCol))
-    Set fileRng = ws.Range(ws.Cells(firstDataRow, fileCol), ws.Cells(firstDataRow + writeN - 1, fileCol))
-    sizeRng.NumberFormat = "0.00"
-    ' Do not format A8:An as a block (collapses A:K row merges). File cells are "@" from the grid.
-    fileRng.Value = outFile
+    ' Value only in A / P — B:K and Q:T stay empty so text spills. No Hyperlinks.Add.
+    ws.Range(ws.Cells(firstDataRow, fileCol), ws.Cells(firstDataRow + writeN - 1, fileCol)).Value = outFile
     ws.Range(ws.Cells(firstDataRow, typeCol), ws.Cells(firstDataRow + writeN - 1, typeCol)).Value2 = outType
-    sizeRng.Value2 = outSize
-    ws.Range(ws.Cells(firstDataRow, dateCol), ws.Cells(firstDataRow + writeN - 1, dateCol)).NumberFormat = "yyyy-mmm-dd"
+    ws.Range(ws.Cells(firstDataRow, sizeCol), ws.Cells(firstDataRow + writeN - 1, sizeCol)).Value2 = outSize
     ws.Range(ws.Cells(firstDataRow, dateCol), ws.Cells(firstDataRow + writeN - 1, dateCol)).Value2 = outDate
     ws.Range(ws.Cells(firstDataRow, driveCol), ws.Cells(firstDataRow + writeN - 1, driveCol)).Value2 = outDrive
     ws.Range(ws.Cells(firstDataRow, folderCol), ws.Cells(firstDataRow + writeN - 1, folderCol)).Value2 = outFolder
     ws.Range(ws.Cells(firstDataRow, linkCol), ws.Cells(firstDataRow + writeN - 1, linkCol)).Value2 = outLink
-
-    sizeRng.NumberFormat = "0.00"
-    sizeRng.HorizontalAlignment = xlRight
-    ws.Range(ws.Cells(firstDataRow, typeCol), ws.Cells(firstDataRow + writeN - 1, typeCol)).HorizontalAlignment = xlCenter
-    ' Do not set File Font/Alignment on A8:An as a block — collapses per-row A:K merges into A8:An
-    ' Folder Path / Drive Address: plain text only (blank repeats are intentional grouping)
-    With ws.Range(ws.Cells(firstDataRow, driveCol), ws.Cells(firstDataRow + writeN - 1, folderCol))
-        .Font.ColorIndex = xlColorIndexAutomatic
-        .Font.Underline = xlUnderlineStyleNone
-    End With
-    Debug.Print "SEARCH: sheet dump+formats=" & FormatSeconds(ElapsedSeconds(tPhase)) & _
-                " sizeSample=" & CStr(outSize(1, 1)) & " (no hyperlink COM)"
+    Debug.Print "SEARCH: sheet dump=" & FormatSeconds(ElapsedSeconds(tPhase)) & _
+                " sizeSample=" & CStr(outSize(1, 1)) & " (spill A:K / P:T)"
 
     WriteSearchStats fileCount, folderCount, Round(totalSizeMb, 2)
 

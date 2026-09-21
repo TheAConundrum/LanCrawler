@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import csv
 import datetime as dt
+import errno
 import os
+import re
 import shutil
 import struct
 import sys
@@ -33,6 +35,9 @@ ACCDB_ROW_THRESHOLD = 750_000
 # in-process and only shrink batches if a lock-count error still fires.
 ACCDB_WRITE_BATCH = 2000
 ACCDB_DELETE_CHUNK = 4000
+# ACE text-ISAM import chunks (INSERT…SELECT from a tab file). Smaller than a
+# full 3M-row statement so MaxLocksPerFile does not trip; larger than ODBC row inserts.
+ACCDB_TEXT_IMPORT_CHUNK = 80_000
 _DAO_DB_MAX_LOCKS_PER_FILE = 8
 _ACE_MAX_LOCKS_PER_FILE = 200_000
 
@@ -91,6 +96,74 @@ except ImportError:  # python crawl.py (direct / right-click Run)
 ENTRY_FILE = "FILE"
 ENTRY_FOLDER = "FOLDER"
 
+SKIP_KIND_NO_ACCESS = "no_access"
+SKIP_KIND_NETWORK = "network"
+SKIP_KIND_MISSING = "missing"
+SKIP_KIND_OTHER = "other"
+RETRYABLE_SKIP_KINDS = frozenset({SKIP_KIND_NETWORK, SKIP_KIND_OTHER})
+SKIP_KIND_LABELS = {
+    SKIP_KIND_NO_ACCESS: "no access",
+    SKIP_KIND_NETWORK: "network",
+    SKIP_KIND_MISSING: "missing",
+    SKIP_KIND_OTHER: "other",
+}
+SKIP_RETRY_ROUNDS = 3
+SKIP_RETRY_DELAY_SEC = 2.0
+
+# winerror.h — prefer .winerror on Windows OSError
+_NO_ACCESS_WINERRORS = frozenset(
+    {
+        5,  # ERROR_ACCESS_DENIED
+        65,  # ERROR_NETWORK_ACCESS_DENIED
+        86,  # ERROR_INVALID_PASSWORD
+        1314,  # ERROR_PRIVILEGE_NOT_HELD
+        1326,  # ERROR_LOGON_FAILURE
+        1327,  # ERROR_ACCOUNT_RESTRICTION
+        1330,  # ERROR_ACCOUNT_EXPIRED
+        1331,  # ERROR_ACCOUNT_DISABLED
+        1907,  # ERROR_PASSWORD_MUST_CHANGE
+        1909,  # ERROR_ACCOUNT_LOCKED_OUT
+        1920,  # ERROR_CANT_ACCESS_FILE
+        2202,  # ERROR_BAD_USERNAME
+    }
+)
+_NETWORK_WINERRORS = frozenset(
+    {
+        51,  # ERROR_REM_NOT_LIST
+        53,  # ERROR_BAD_NETPATH
+        58,  # ERROR_BAD_NET_RESP
+        59,  # ERROR_UNEXP_NET_ERR
+        64,  # ERROR_NETNAME_DELETED
+        67,  # ERROR_BAD_NET_NAME
+        121,  # ERROR_SEM_TIMEOUT
+        1231,  # ERROR_NETWORK_UNREACHABLE
+        1232,  # ERROR_NO_NET_OR_BAD_PATH
+        1460,  # ERROR_TIMEOUT
+        10053,  # WSAECONNABORTED
+        10054,  # WSAECONNRESET
+        10060,  # WSAETIMEDOUT
+        10061,  # WSAECONNREFUSED
+        10064,  # WSAEHOSTDOWN
+        10065,  # WSAEHOSTUNREACH
+    }
+)
+_MISSING_WINERRORS = frozenset(
+    {
+        2,  # ERROR_FILE_NOT_FOUND
+        3,  # ERROR_PATH_NOT_FOUND
+        161,  # ERROR_BAD_PATHNAME
+        267,  # ERROR_DIRECTORY
+    }
+)
+_RETRYABLE_OTHER_WINERRORS = frozenset(
+    {
+        21,  # ERROR_NOT_READY
+        32,  # ERROR_SHARING_VIOLATION
+        33,  # ERROR_LOCK_VIOLATION
+        1450,  # ERROR_NO_SYSTEM_RESOURCES
+    }
+)
+
 ProgressCb = Callable[[str], None]
 StatsCb = Callable[["CrawlStats"], None]
 
@@ -115,8 +188,24 @@ class FolderScanResult:
     file_rows: list[IndexRow] = field(default_factory=list)
     subfolders: list[str] = field(default_factory=list)
     error: str = ""
+    error_kind: str = ""
+    winerror: int | None = None
     dir_mtime: float = 0.0
     skipped: bool = False  # True = dir mtime unchanged; restated known files only
+
+
+@dataclass
+class SkipRecord:
+    path: str
+    unc: str = ""
+    kind: str = SKIP_KIND_OTHER
+    error: str = ""
+    attempts: int = 1
+    recovered: bool = False
+
+    @property
+    def retryable(self) -> bool:
+        return (not self.recovered) and self.kind in RETRYABLE_SKIP_KINDS
 
 
 @dataclass
@@ -132,6 +221,13 @@ class CrawlStats:
     incremental: bool = False
     started: float = 0.0
     finished: float = 0.0
+    skip_no_access: int = 0
+    skip_network: int = 0
+    skip_missing: int = 0
+    skip_other: int = 0
+    skip_recovered: int = 0
+    skip_log_path: str = ""
+    skips: list[SkipRecord] = field(default_factory=list)
 
     @property
     def folders_done(self) -> int:
@@ -141,6 +237,104 @@ class CrawlStats:
     def elapsed(self) -> float:
         end = self.finished or time.time()
         return max(0.0, end - self.started)
+
+
+def _skip_kind_label(kind: str) -> str:
+    return SKIP_KIND_LABELS.get(kind, kind or SKIP_KIND_OTHER)
+
+
+def classify_folder_error(exc: BaseException) -> tuple[str, str, int | None]:
+    """Return (kind, message, winerror) for a folder OSError.
+
+    no_access: this account cannot open the folder (do not retry).
+    network: share dropped / timed out / unreachable (retry after the crawl).
+    missing: path is gone.
+    other: unexpected; retried like network.
+    """
+    message = str(exc)
+    winerror_raw = getattr(exc, "winerror", None)
+    errno_raw = getattr(exc, "errno", None)
+    winerror = winerror_raw if isinstance(winerror_raw, int) else None
+    errno_v = errno_raw if isinstance(errno_raw, int) else None
+    if winerror is None:
+        match = re.search(r"\[WinError\s+(\d+)\]", message, re.I)
+        if match:
+            winerror = int(match.group(1))
+    if errno_v is None:
+        match = re.search(r"\[Errno\s+(\d+)\]", message, re.I)
+        if match:
+            errno_v = int(match.group(1))
+
+    if winerror is not None:
+        if winerror in _NO_ACCESS_WINERRORS:
+            return SKIP_KIND_NO_ACCESS, message, winerror
+        if winerror in _NETWORK_WINERRORS:
+            return SKIP_KIND_NETWORK, message, winerror
+        if winerror in _MISSING_WINERRORS:
+            return SKIP_KIND_MISSING, message, winerror
+        if winerror in _RETRYABLE_OTHER_WINERRORS:
+            return SKIP_KIND_OTHER, message, winerror
+        return SKIP_KIND_OTHER, message, winerror
+
+    if errno_v in (errno.EACCES, errno.EPERM):
+        return SKIP_KIND_NO_ACCESS, message, winerror
+    if errno_v in (errno.ENOENT, errno.ENOTDIR):
+        return SKIP_KIND_MISSING, message, winerror
+    network_errnos = {
+        getattr(errno, name)
+        for name in ("ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH", "ECONNRESET")
+        if getattr(errno, name, None) is not None
+    }
+    if errno_v in network_errnos:
+        return SKIP_KIND_NETWORK, message, winerror
+    if errno_v in (errno.EAGAIN, errno.EBUSY):
+        return SKIP_KIND_OTHER, message, winerror
+    return SKIP_KIND_OTHER, message, winerror
+
+
+def _apply_folder_oserror(result: FolderScanResult, exc: OSError) -> FolderScanResult:
+    kind, message, winerror = classify_folder_error(exc)
+    result.error = message
+    result.error_kind = kind
+    result.winerror = winerror
+    return result
+
+
+def write_skip_log(
+    path: str | Path,
+    *,
+    root: str,
+    records: list[SkipRecord],
+) -> None:
+    """Write a tab-separated skip log (remaining skips first, then recovered)."""
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    remaining = [r for r in records if not r.recovered]
+    recovered = [r for r in records if r.recovered]
+    remaining.sort(key=lambda r: (r.kind, r.path.lower()))
+    recovered.sort(key=lambda r: (r.kind, r.path.lower()))
+    lines = [
+        "# LAN Search Tool skip log",
+        f"# root={root}",
+        (
+            f"# skipped={len(remaining)} recovered={len(recovered)} "
+            f"no_access={sum(1 for r in remaining if r.kind == SKIP_KIND_NO_ACCESS)} "
+            f"network={sum(1 for r in remaining if r.kind == SKIP_KIND_NETWORK)} "
+            f"missing={sum(1 for r in remaining if r.kind == SKIP_KIND_MISSING)} "
+            f"other={sum(1 for r in remaining if r.kind == SKIP_KIND_OTHER)}"
+        ),
+        "status\tkind\tattempts\tpath\terror",
+    ]
+
+    def _row(status: str, rec: SkipRecord) -> str:
+        err = rec.error.replace("\t", " ").replace("\r", " ").replace("\n", " ")
+        return f"{status}\t{rec.kind}\t{rec.attempts}\t{rec.path}\t{err}"
+
+    for rec in remaining:
+        lines.append(_row("skipped", rec))
+    for rec in recovered:
+        lines.append(_row("recovered", rec))
+    out.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def _date_only_from_timestamp(ts: float | None) -> str:
@@ -182,8 +376,7 @@ def scan_folder(
     try:
         entries = list(os.scandir(folder_path))
     except OSError as exc:
-        result.error = str(exc)
-        return result
+        return _apply_folder_oserror(result, exc)
 
     for entry in entries:
         name = entry.name
@@ -285,13 +478,13 @@ def visit_folder(
             getattr(st_root, "st_ctime", None) or st_root.st_mtime
         )
     except OSError as exc:
-        return FolderScanResult(
+        result = FolderScanResult(
             folder_path=folder_path,
             folder_unc=folder_unc,
             created_date="",
             local_bytes=0,
-            error=str(exc),
         )
+        return _apply_folder_oserror(result, exc)
 
     can_skip = (
         incremental
@@ -353,11 +546,18 @@ def crawl_parallel(
     incremental: bool = False,
     previous: PreviousIndex | None = None,
     cancel_event: threading.Event | None = None,
+    skip_log_path: str | Path | None = None,
+    retry_skips: bool = True,
+    retry_rounds: int = SKIP_RETRY_ROUNDS,
+    retry_delay_sec: float = SKIP_RETRY_DELAY_SEC,
 ) -> tuple[list[IndexRow], CrawlStats]:
     """Crawl root_path with a thread pool. Returns (tblFiles rows, stats).
 
     incremental=True plus a PreviousIndex with folder timestamps: skip scandir on
     unchanged folders, re-stat known files, and still walk known child folders.
+
+    Folders that fail are classified (no access vs network vs missing). Network /
+    timeout-like failures are retried after the main crawl with fewer workers.
     """
     start = ensure_crawl_start(root_path)
     start_s = str(start)
@@ -370,30 +570,83 @@ def crawl_parallel(
     folder_meta: dict[str, str] = {}
     folder_mtime: dict[str, float] = {}
     local_bytes: dict[str, int] = {}
+    skips: dict[str, SkipRecord] = {}
 
     def emit(msg: str) -> None:
         if on_progress:
             on_progress(msg)
 
+    def refresh_skip_stats() -> None:
+        remaining = [s for s in skips.values() if not s.recovered]
+        stats.skip_no_access = sum(1 for s in remaining if s.kind == SKIP_KIND_NO_ACCESS)
+        stats.skip_network = sum(1 for s in remaining if s.kind == SKIP_KIND_NETWORK)
+        stats.skip_missing = sum(1 for s in remaining if s.kind == SKIP_KIND_MISSING)
+        stats.skip_other = sum(1 for s in remaining if s.kind == SKIP_KIND_OTHER)
+        stats.skip_recovered = sum(1 for s in skips.values() if s.recovered)
+        stats.errors = len(remaining)
+        stats.skips = list(skips.values())
+
     def push_stats() -> None:
         stats.files_indexed = len(file_rows)
         stats.folders_indexed = len(folder_meta)
+        refresh_skip_stats()
         if on_stats:
             on_stats(stats)
 
-    def mark_seen(path: str, seen: set[str]) -> bool:
+    def mark_seen(path: str, seen_set: set[str]) -> bool:
         key = _norm_key(path)
         unc_key = _norm_key(to_unc_path(path, drive_map, unc_root_override))
-        if key in seen or unc_key in seen:
+        if key in seen_set or unc_key in seen_set:
             return False
-        seen.add(key)
+        seen_set.add(key)
         if unc_key:
-            seen.add(unc_key)
+            seen_set.add(unc_key)
         return True
+
+    def remember_skip(path: str, unc: str, kind: str, error: str) -> None:
+        key = _norm_key(path)
+        prev = skips.get(key)
+        attempts = (prev.attempts + 1) if prev else 1
+        skips[key] = SkipRecord(
+            path=path,
+            unc=unc,
+            kind=kind or SKIP_KIND_OTHER,
+            error=error,
+            attempts=attempts,
+            recovered=False,
+        )
+
+    def apply_success(res: FolderScanResult) -> None:
+        skip_key = _norm_key(res.folder_path)
+        if skip_key in skips and not skips[skip_key].recovered:
+            skips[skip_key].recovered = True
+            emit(
+                f"recovered ({_skip_kind_label(skips[skip_key].kind)}) {res.folder_path}"
+            )
+        if res.skipped:
+            stats.folders_quick += 1
+            if res.folder_unc:
+                folder_meta[res.folder_unc] = res.created_date
+                folder_mtime[res.folder_unc] = res.dir_mtime
+                local_bytes[res.folder_unc] = res.local_bytes
+            file_rows.extend(res.file_rows)
+        else:
+            stats.folders_scanned += 1
+            if res.folder_unc:
+                folder_meta[res.folder_unc] = res.created_date
+                folder_mtime[res.folder_unc] = res.dir_mtime
+                local_bytes[res.folder_unc] = local_bytes.get(res.folder_unc, 0) + res.local_bytes
+            file_rows.extend(res.file_rows)
+        for sub in res.subfolders:
+            if is_junk_folder_name(Path(sub).name):
+                continue
+            if mark_seen(sub, seen):
+                queued.append(sub)
 
     seen: set[str] = set()
     n_workers = max(1, int(workers))
     max_outstanding = max(n_workers * 8, 32)
+    outstanding_limit = max_outstanding
     queued: deque[str] = deque()
     in_flight: dict[Future, str] = {}
 
@@ -401,7 +654,7 @@ def crawl_parallel(
     queued.append(start_s)
 
     def submit_more(pool: ThreadPoolExecutor) -> None:
-        while queued and len(in_flight) < max_outstanding:
+        while queued and len(in_flight) < outstanding_limit:
             if cancel_event is not None and cancel_event.is_set():
                 return
             path = queued.popleft()
@@ -416,8 +669,7 @@ def crawl_parallel(
             )
             in_flight[fut] = path
 
-    with ThreadPoolExecutor(max_workers=n_workers, thread_name_prefix="lan-crawl") as pool:
-        submit_more(pool)
+    def drain_pool(pool: ThreadPoolExecutor) -> None:
         while in_flight or queued:
             if cancel_event is not None and cancel_event.is_set() and not in_flight:
                 break
@@ -428,41 +680,25 @@ def crawl_parallel(
             done, _still = wait(list(in_flight.keys()), return_when=FIRST_COMPLETED)
             progressed = False
             for fut in done:
-                in_flight.pop(fut, None)
+                folder_path = in_flight.pop(fut, "")
                 try:
                     res: FolderScanResult = fut.result()
                 except Exception as exc:  # noqa: BLE001 — isolate worker failures
-                    stats.errors += 1
-                    emit(f"worker error: {exc}")
+                    kind, message, _win = classify_folder_error(exc)
+                    remember_skip(folder_path, "", kind, message)
+                    emit(f"skip ({_skip_kind_label(kind)}) {folder_path}: {message}")
                     continue
 
                 if res.error:
-                    stats.errors += 1
-                    emit(f"skip {res.folder_path}: {res.error}")
-                elif res.skipped:
-                    stats.folders_quick += 1
-                    progressed = True
-                    if res.folder_unc:
-                        folder_meta[res.folder_unc] = res.created_date
-                        folder_mtime[res.folder_unc] = res.dir_mtime
-                        local_bytes[res.folder_unc] = res.local_bytes
-                    file_rows.extend(res.file_rows)
+                    kind = res.error_kind or SKIP_KIND_OTHER
+                    remember_skip(res.folder_path, res.folder_unc, kind, res.error)
+                    emit(f"skip ({_skip_kind_label(kind)}) {res.folder_path}: {res.error}")
                 else:
-                    stats.folders_scanned += 1
                     progressed = True
-                    if res.folder_unc:
-                        folder_meta[res.folder_unc] = res.created_date
-                        folder_mtime[res.folder_unc] = res.dir_mtime
-                        local_bytes[res.folder_unc] = local_bytes.get(res.folder_unc, 0) + res.local_bytes
-                    file_rows.extend(res.file_rows)
-
-                for sub in res.subfolders:
-                    if is_junk_folder_name(Path(sub).name):
-                        continue
-                    if mark_seen(sub, seen):
-                        queued.append(sub)
+                    apply_success(res)
 
             stats.pending = len(in_flight) + len(queued)
+            refresh_skip_stats()
             if progressed and stats.folders_done > 0 and stats.folders_done % progress_every == 0:
                 emit(
                     f"folders={stats.folders_done:,} "
@@ -470,24 +706,74 @@ def crawl_parallel(
                     f"quick={stats.folders_quick:,} "
                     f"files={len(file_rows):,} "
                     f"pending={stats.pending:,} "
-                    f"errors={stats.errors:,}"
+                    f"errors={stats.errors:,} "
+                    f"no_access={stats.skip_no_access:,} "
+                    f"network={stats.skip_network:,}"
                 )
             push_stats()
             if cancel_event is not None and cancel_event.is_set():
                 queued.clear()
                 stats.cancelled = True
                 emit("cancelled — stopping after in-flight folders")
-                # Drain remaining futures so the pool can exit cleanly
                 continue
             submit_more(pool)
 
+    with ThreadPoolExecutor(max_workers=n_workers, thread_name_prefix="lan-crawl") as pool:
+        submit_more(pool)
+        drain_pool(pool)
+        if (
+            retry_skips
+            and not stats.cancelled
+            and (cancel_event is None or not cancel_event.is_set())
+        ):
+            rounds = max(0, int(retry_rounds))
+            delay = max(0.0, float(retry_delay_sec))
+            outstanding_limit = max(2, min(8, n_workers // 2 or 4))
+            for round_i in range(1, rounds + 1):
+                pending = [s for s in skips.values() if s.retryable]
+                if not pending:
+                    break
+                emit(
+                    f"retry {len(pending):,} network/timeout folder(s) "
+                    f"(round {round_i}/{rounds}, {outstanding_limit} in flight)"
+                )
+                if delay > 0:
+                    time.sleep(delay * round_i)
+                for rec in pending:
+                    queued.append(rec.path)
+                drain_pool(pool)
+
+    def persist_skip_log() -> None:
+        refresh_skip_stats()
+        if skip_log_path is None:
+            return
+        if not skips:
+            return
+        log_path = Path(skip_log_path)
+        try:
+            write_skip_log(log_path, root=start_s, records=list(skips.values()))
+            stats.skip_log_path = str(log_path)
+            emit(
+                f"skip log: {log_path} "
+                f"(no access={stats.skip_no_access:,} "
+                f"network={stats.skip_network:,} "
+                f"missing={stats.skip_missing:,} "
+                f"other={stats.skip_other:,} "
+                f"recovered={stats.skip_recovered:,})"
+            )
+        except OSError as exc:
+            emit(f"skip log write failed: {exc}")
+
     if stats.cancelled:
+        persist_skip_log()
         stats.files_indexed = len(file_rows)
         stats.folders_indexed = len(folder_meta)
         stats.finished = time.time()
         emit(f"cancelled after folders={stats.folders_done:,} files={len(file_rows):,}")
         push_stats()
         return [], stats
+
+    persist_skip_log()
 
     totals = _bubble_folder_bytes(local_bytes, crawl_root_unc)
 
@@ -516,7 +802,11 @@ def crawl_parallel(
     emit(
         f"done files={stats.files_indexed:,} folders={stats.folders_indexed:,} "
         f"scan={stats.folders_scanned:,} quick={stats.folders_quick:,} "
-        f"errors={stats.errors:,} elapsed={stats.elapsed:.1f}s "
+        f"errors={stats.errors:,} "
+        f"no_access={stats.skip_no_access:,} "
+        f"network={stats.skip_network:,} "
+        f"recovered={stats.skip_recovered:,} "
+        f"elapsed={stats.elapsed:.1f}s "
         f"disk_bytes={stats.bytes_all_files:,}"
     )
     push_stats()
@@ -1040,6 +1330,20 @@ def _create_accdb_index(cur, conn, index_name: str, table_name: str, column: str
         _safe_rollback(conn)
 
 
+def _drop_accdb_index(cur, conn, index_name: str, table_name: str) -> None:
+    try:
+        cur.execute(f"DROP INDEX [{index_name}] ON [{table_name}]")
+        conn.commit()
+    except Exception:  # noqa: BLE001
+        _safe_rollback(conn)
+
+
+def _drop_accdb_bulk_indexes(cur, conn) -> None:
+    _drop_accdb_index(cur, conn, "ix_tblFiles_path", "tblFiles")
+    _drop_accdb_index(cur, conn, "ix_tblFiles_type", "tblFiles")
+    _drop_accdb_index(cur, conn, "ix_tblFolderMeta_path", "tblFolderMeta")
+
+
 def _ensure_accdb_indexes(cur, conn) -> None:
     if _accdb_table_exists(cur, "tblFiles"):
         _create_accdb_index(cur, conn, "ix_tblFiles_path", "tblFiles", "FilePath")
@@ -1093,6 +1397,159 @@ def _executemany_committed(
                     )
                 continue
             raise
+
+
+class _AceTextImportError(RuntimeError):
+    """ACE text-ISAM import failed. started=True means some rows already committed."""
+
+    def __init__(self, message: str, *, started: bool) -> None:
+        super().__init__(message)
+        self.started = started
+
+
+def _ace_schema_col_type(column: str) -> str:
+    key = column.strip().lower()
+    if key in {"filepath", "folderpath"}:
+        return "Memo"
+    if key in {"sizemb", "dirmtime", "localbytes"}:
+        return "Double"
+    return "Text"
+
+
+def _ace_text_table_ref(folder: Path, filename: str) -> str:
+    db = str(folder).replace("/", "\\")
+    if not db.endswith("\\"):
+        db += "\\"
+    stem, dot, ext = filename.rpartition(".")
+    if not dot:
+        stem, ext = filename, "txt"
+    return (
+        f"[Text;HDR=Yes;FMT=Delimited;CharacterSet=Unicode;Database={db}]"
+        f".[{stem}#{ext}]"
+    )
+
+
+def _write_ace_schema_ini(folder: Path, filename: str, columns: list[str]) -> None:
+    lines = [
+        f"[{filename}]",
+        "Format=TabDelimited",
+        "ColNameHeader=True",
+        "MaxScanRows=0",
+        "CharacterSet=Unicode",
+    ]
+    for i, col in enumerate(columns, start=1):
+        lines.append(f"Col{i}={col} {_ace_schema_col_type(col)}")
+    (folder / "schema.ini").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _format_ace_text_value(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, float):
+        return f"{value:.10g}"
+    if isinstance(value, int):
+        return str(value)
+    return str(value).replace("\t", " ").replace("\r", " ").replace("\n", " ")
+
+
+def _write_ace_tab_file(
+    path: Path, columns: list[str], records: list[tuple[Any, ...]]
+) -> None:
+    with path.open("w", encoding="utf-16", newline="") as handle:
+        writer = csv.writer(handle, dialect="excel-tab", lineterminator="\r\n")
+        writer.writerow(columns)
+        for rec in records:
+            writer.writerow([_format_ace_text_value(v) for v in rec])
+
+
+def _insert_via_ace_text(
+    cur,
+    conn,
+    *,
+    table_name: str,
+    columns: list[str],
+    records: list[tuple[Any, ...]],
+    on_progress: ProgressCb | None = None,
+) -> None:
+    """INSERT…SELECT from UTF-16 tab files (ACE text ISAM). Much faster than ODBC row inserts."""
+    if not records:
+        return
+    col_sql = ", ".join(f"[{c}]" for c in columns)
+    tmp = Path(tempfile.mkdtemp(prefix="lan_accdb_load_"))
+    committed = 0
+    chunk_size = max(1, int(ACCDB_TEXT_IMPORT_CHUNK))
+    try:
+        i = 0
+        n = len(records)
+        file_idx = 0
+        while i < n:
+            chunk = records[i : i + chunk_size]
+            fname = f"load_{file_idx:04d}.txt"
+            _write_ace_tab_file(tmp / fname, columns, chunk)
+            _write_ace_schema_ini(tmp, fname, columns)
+            sql = (
+                f"INSERT INTO [{table_name}] ({col_sql}) "
+                f"SELECT {col_sql} FROM {_ace_text_table_ref(tmp, fname)}"
+            )
+            try:
+                cur.execute(sql)
+                conn.commit()
+            except Exception as exc:  # noqa: BLE001
+                _safe_rollback(conn)
+                if _is_ace_lock_count_error(exc) and chunk_size > 1:
+                    chunk_size = max(1, chunk_size // 2)
+                    if on_progress is not None:
+                        on_progress(
+                            f"    AccDB lock limit — retrying text import in chunks of "
+                            f"{chunk_size:,}"
+                        )
+                    continue
+                raise _AceTextImportError(str(exc), started=committed > 0) from exc
+            committed += len(chunk)
+            i += len(chunk)
+            file_idx += 1
+            if on_progress is not None:
+                on_progress(f"    AccDB imported {committed:,} / {n:,} into {table_name}")
+            try:
+                (tmp / fname).unlink()
+            except OSError:
+                pass
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _insert_accdb_records(
+    cur,
+    conn,
+    *,
+    table_name: str,
+    columns: list[str],
+    records: list[tuple[Any, ...]],
+    insert_sql: str,
+    on_progress: ProgressCb | None = None,
+) -> None:
+    if not records:
+        return
+    try:
+        _insert_via_ace_text(
+            cur,
+            conn,
+            table_name=table_name,
+            columns=columns,
+            records=records,
+            on_progress=on_progress,
+        )
+        return
+    except _AceTextImportError as exc:
+        if exc.started:
+            raise
+        if on_progress is not None:
+            on_progress(
+                f"    AccDB text import unavailable ({exc}); using row inserts"
+            )
+    _executemany_committed(cur, conn, insert_sql, records, on_progress=on_progress)
 
 
 def _chunked_delete_by_paths(
@@ -1385,6 +1842,7 @@ def _insert_folder_meta_rows(
         "INSERT INTO tblFolderMeta (FolderPath, DirMtime, LocalBytes, CreatedDate) "
         "VALUES (?, ?, ?, ?)"
     )
+    columns = ["FolderPath", "DirMtime", "LocalBytes", "CreatedDate"]
     records: list[tuple[Any, ...]] = [
         (
             strip_trailing_slash(r.path),
@@ -1394,7 +1852,15 @@ def _insert_folder_meta_rows(
         )
         for r in folders
     ]
-    _executemany_committed(cur, conn, insert_sql, records, on_progress=on_progress)
+    _insert_accdb_records(
+        cur,
+        conn,
+        table_name="tblFolderMeta",
+        columns=columns,
+        records=records,
+        insert_sql=insert_sql,
+        on_progress=on_progress,
+    )
 
 
 def _read_accdb_ingest_log(cur) -> list[IngestLogRow]:
@@ -1502,10 +1968,19 @@ def _insert_accdb_file_rows(
     insert_sql = (
         "INSERT INTO tblFiles (FilePath, FileDate, SizeMB, EntryType) VALUES (?, ?, ?, ?)"
     )
+    columns = ["FilePath", "FileDate", "SizeMB", "EntryType"]
     records: list[tuple[Any, ...]] = [
         (r.path, r.file_date or None, float(r.size_mb), r.entry_type) for r in rows
     ]
-    _executemany_committed(cur, conn, insert_sql, records, on_progress=on_progress)
+    _insert_accdb_records(
+        cur,
+        conn,
+        table_name="tblFiles",
+        columns=columns,
+        records=records,
+        insert_sql=insert_sql,
+        on_progress=on_progress,
+    )
 
 
 def write_accdb(
@@ -1553,7 +2028,9 @@ def write_accdb(
     conn = _open_accdb(out_path)
     try:
         cur = conn.cursor()
-        _ensure_accdb_tables(cur, conn)
+        _ensure_accdb_tables(cur, conn, with_indexes=False)
+        note("  AccDB dropping indexes for bulk load ...")
+        _drop_accdb_bulk_indexes(cur, conn)
 
         existing_log = _read_accdb_ingest_log(cur) if not created_new else []
 
@@ -1562,7 +2039,7 @@ def write_accdb(
             note(f"  AccDB full write {len(rows):,} rows ...")
             _drop_accdb_table(cur, conn, "tblFiles")
             _drop_accdb_table(cur, conn, "tblFolderMeta")
-            _ensure_accdb_tables(cur, conn)
+            _ensure_accdb_tables(cur, conn, with_indexes=False)
             _insert_accdb_file_rows(cur, conn, rows, on_progress=on_progress)
             _insert_folder_meta_rows(cur, conn, rows, on_progress=on_progress)
             if ingest_log is not None:
@@ -1574,6 +2051,8 @@ def write_accdb(
             else:
                 log_rows = []
             _rewrite_accdb_ingest_log(cur, conn, log_rows)
+            note("  AccDB rebuilding indexes ...")
+            _ensure_accdb_indexes(cur, conn)
             note(
                 f"AccDB full write: files={len(rows):,} ingest_scans={len(log_rows)} "
                 f"in {time.time() - t0:.1f}s"
@@ -1596,6 +2075,8 @@ def write_accdb(
         else:
             log_rows = _merge_ingest_log(existing_log, new_ingest)
         _rewrite_accdb_ingest_log(cur, conn, log_rows)
+        note("  AccDB rebuilding indexes ...")
+        _ensure_accdb_indexes(cur, conn)
         note(
             f"AccDB ReplaceRoot: removed~{deleted} prior rows under {root}; "
             f"ingest scans now={len(log_rows)} in {time.time() - t0:.1f}s"
@@ -1699,6 +2180,12 @@ def pick_workbook(
 
 def _default_out_dir() -> Path:
     return Path(__file__).resolve().parent.parent.parent / "crawl_output"
+
+
+def skip_log_path_for_accdb(accdb: str | Path | None) -> Path:
+    if accdb is not None:
+        return Path(accdb).parent / "crawl_skips.txt"
+    return _default_out_dir() / "crawl_skips.txt"
 
 
 def remove_crawl_output_dir(out_dir: Path | None = None) -> None:
@@ -1881,6 +2368,7 @@ def run_interactive(
             incremental=use_inc,
             previous=previous,
             cancel_event=cancel_event,
+            skip_log_path=skip_log_path_for_accdb(accdb_out),
         )
         job["rows"] = rows
         job["stats"] = stats
@@ -1891,7 +2379,11 @@ def run_interactive(
             f"Crawl done: {len(rows):,} rows  "
             f"files={stats.files_indexed:,} folders={stats.folders_indexed:,} "
             f"scan={stats.folders_scanned:,} quick={stats.folders_quick:,} "
-            f"errors={stats.errors:,} disk~{bytes_to_size_mb(stats.bytes_all_files):,.2f} MB "
+            f"errors={stats.errors:,} "
+            f"no_access={stats.skip_no_access:,} "
+            f"network={stats.skip_network:,} "
+            f"recovered={stats.skip_recovered:,} "
+            f"disk~{bytes_to_size_mb(stats.bytes_all_files):,.2f} MB "
             f"in {time.time() - t0:.1f}s"
         )
 

@@ -180,6 +180,8 @@ def run_summit_lan_scan(
                     incremental=use_inc,
                     previous=previous,
                     cancel_event=cancel_event,
+                    skip_log_path=accdb_out.parent
+                    / f"crawl_skips-{letter.rstrip(':')}.txt",
                 )
             except Exception as exc:  # noqa: BLE001 — keep remaining drives
                 emit(f"  FAILED {letter}: {exc}")

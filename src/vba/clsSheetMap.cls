@@ -65,21 +65,20 @@ Private Const ADDR_STAT_FILES_VAL As String = "M3"
 Private Const ADDR_STAT_FOLDERS_VAL As String = "M4"
 Private Const ADDR_STAT_SIZE_VAL As String = "M5"
 ' Results headers row 7; grey divider row 6; data from row 8+.
-' File A:K | Type L | Size MB M | Date N | Drive Address O | Folder Path P:T
+' File lives in A and spills across empty B:K; Folder Path lives in P and spills across empty Q:T.
+' No merges, wrap off. L File Type | M Size MB | N Date Created | O Drive Address. Hidden UNC in U.
 Private Const RESULTS_HEADER_ROW As Long = 7
 Private Const RESULTS_DIVIDER_ROW As Long = 6
 Private Const RESULTS_FILE_COL As Long = 1           ' A
-Private Const RESULTS_FILE_COL_END As Long = 11      ' K  (File merges A:K)
+Private Const RESULTS_FILE_COL_END As Long = 11      ' K  (empty so File spills)
 Private Const RESULTS_TYPE_COL As Long = 12          ' L File Type
-Private Const RESULTS_SIZE_COL As Long = 13           ' M Size MB
+Private Const RESULTS_SIZE_COL As Long = 13          ' M Size MB
 Private Const RESULTS_DATE_COL As Long = 14          ' N Date Created
-Private Const RESULTS_DRIVE_COL As Long = 15         ' O Drive Address (friendly label)
+Private Const RESULTS_DRIVE_COL As Long = 15         ' O Drive Address
 Private Const RESULTS_FOLDER_COL As Long = 16        ' P Folder Path
-Private Const RESULTS_FOLDER_COL_END As Long = 20    ' T  (Folder Path merges P:T)
+Private Const RESULTS_FOLDER_COL_END As Long = 20    ' T  (empty so Folder Path spills)
 Private Const RESULTS_LAST_COL As Long = 20
-' Hidden UNC targets for double-click open (not part of visible results band).
 Private Const RESULTS_LINK_COL As Long = 21          ' U
-' Soft cap for on-sheet results (merges/stripes are prebuilt once for this height).
 Private Const RESULTS_MAX_ROWS As Long = 20000
 
 Private mWorkbook As Workbook
@@ -302,6 +301,10 @@ Public Property Get ResultsFirstDataRow() As Long
     ResultsFirstDataRow = RESULTS_HEADER_ROW + 1
 End Property
 
+Public Property Get ResultsLastDataRow() As Long
+    ResultsLastDataRow = RESULTS_HEADER_ROW + RESULTS_MAX_ROWS
+End Property
+
 Public Property Get IngestedHeaderRow() As Long
     IngestedHeaderRow = INGESTED_HEADER_ROW
 End Property
@@ -372,7 +375,7 @@ Public Sub EnsureDashboardChromeMerges()
     On Error GoTo 0
 End Sub
 
-' Lazy build of results band (merges + stripes) when missing — used by search, not Workbook_Open.
+' Drop leftover tblResults, unmerge File/Folder bands, wrap off so A and P spill.
 Public Sub EnsureResultsDisplayGrid()
     Dim ws As Worksheet
     Dim firstRow As Long
@@ -388,115 +391,163 @@ Public Sub EnsureResultsDisplayGrid()
     lastRow = firstRow + RESULTS_MAX_ROWS - 1
     EnsureLinkColumnHidden ws
 
-    If ResultsGridLooksReady(ws, firstRow, lastRow) Then
-        Debug.Print "INDEX CACHE: results grid already ready rows=" & CStr(RESULTS_MAX_ROWS)
+    If ResultsSpillLayoutReady(ws, firstRow, lastRow) Then
+        Debug.Print "INDEX CACHE: results spill layout ready rows=" & CStr(RESULTS_MAX_ROWS)
         EnsureResultsAutoFilter ws
         Exit Sub
     End If
 
-    BuildResultsDisplayGridCore ws, firstRow, lastRow
+    ApplyResultsSpillLayout ws, firstRow, lastRow
 End Sub
 
-Private Sub BuildResultsDisplayGridCore(ByVal ws As Worksheet, ByVal firstRow As Long, ByVal lastRow As Long)
-    Dim r As Long
-    Dim i As Long
-    Dim rowRng As Range
-    Dim stripeGrey As Long
-    Dim stripeWhite As Long
+Private Sub RemoveResultsTableIfPresent(ByVal ws As Worksheet)
+    Dim lo As ListObject
+    On Error Resume Next
+    Set lo = ws.ListObjects(TABLE_RESULTS)
+    If Not lo Is Nothing Then lo.Unlist
+    On Error GoTo 0
+End Sub
+
+Private Sub ApplyResultsSpillLayout(ByVal ws As Worksheet, ByVal firstRow As Long, ByVal lastRow As Long)
+    Dim band As Range
+    Dim fileBand As Range
+    Dim folderBand As Range
     Dim t0 As Double
-    Dim screenPrev As Boolean
-    Dim eventsPrev As Boolean
-    Dim calcPrev As XlCalculation
 
     t0 = Timer
-    screenPrev = Application.ScreenUpdating
-    eventsPrev = Application.EnableEvents
-    calcPrev = Application.Calculation
-    Application.ScreenUpdating = False
-    Application.EnableEvents = False
-    Application.Calculation = xlCalculationManual
     On Error Resume Next
-    Application.StatusBar = "LAN Search: building results grid (" & CStr(RESULTS_MAX_ROWS) & " rows)..."
+    Application.StatusBar = "LAN Search: preparing results grid..."
     On Error GoTo 0
 
+    RemoveResultsTableIfPresent ws
+    ClearResultsAutoFilter ws
     EnsureDashboardChromeMerges
 
-    stripeWhite = RGB(255, 255, 255)
-    stripeGrey = RGB(242, 242, 242)
+    Set band = ws.Range(ws.Cells(RESULTS_HEADER_ROW, RESULTS_FILE_COL), _
+                        ws.Cells(lastRow, RESULTS_LAST_COL))
+    Set fileBand = ws.Range(ws.Cells(RESULTS_HEADER_ROW, RESULTS_FILE_COL), _
+                            ws.Cells(lastRow, RESULTS_FILE_COL_END))
+    Set folderBand = ws.Range(ws.Cells(RESULTS_HEADER_ROW, RESULTS_FOLDER_COL), _
+                              ws.Cells(lastRow, RESULTS_FOLDER_COL_END))
 
-    For r = firstRow To lastRow
-        i = r - firstRow + 1
-        SafeMerge ws, r, RESULTS_FILE_COL, RESULTS_FILE_COL_END
-        SafeMerge ws, r, RESULTS_FOLDER_COL, RESULTS_FOLDER_COL_END
-        Set rowRng = ws.Range(ws.Cells(r, RESULTS_FILE_COL), ws.Cells(r, RESULTS_LAST_COL))
-        If (i Mod 2) = 0 Then
-            rowRng.Interior.Color = stripeGrey
-        Else
-            rowRng.Interior.Color = stripeWhite
-        End If
-        ' Format per row — never Range(A8:A20007).* (Excel collapses A:K into A8:A20007)
-        With ws.Cells(r, RESULTS_FILE_COL)
-            .NumberFormat = "@"
-            .HorizontalAlignment = xlLeft
-            .Font.Color = RGB(5, 99, 193)
-            .Font.Underline = xlUnderlineStyleSingle
-        End With
-        With ws.Range(ws.Cells(r, RESULTS_DRIVE_COL), ws.Cells(r, RESULTS_FOLDER_COL_END))
-            .HorizontalAlignment = xlLeft
-            .Font.ColorIndex = xlColorIndexAutomatic
-            .Font.Underline = xlUnderlineStyleNone
-        End With
-        If i Mod 250 = 0 Then
-            On Error Resume Next
-            Application.StatusBar = "LAN Search: results grid " & CStr(i) & "/" & CStr(RESULTS_MAX_ROWS)
-            On Error GoTo 0
-            DoEvents
-        End If
-    Next r
+    On Error Resume Next
+    fileBand.UnMerge
+    folderBand.UnMerge
+    band.UnMerge
+    On Error GoTo 0
 
+    band.WrapText = False
+    fileBand.WrapText = False
+    folderBand.WrapText = False
+
+    ws.Range(ws.Cells(RESULTS_HEADER_ROW, RESULTS_FILE_COL), _
+             ws.Cells(RESULTS_HEADER_ROW, RESULTS_LAST_COL)).ClearContents
+    ws.Cells(RESULTS_HEADER_ROW, RESULTS_FILE_COL).Value = "File"
+    ws.Cells(RESULTS_HEADER_ROW, RESULTS_TYPE_COL).Value = "File Type"
+    ws.Cells(RESULTS_HEADER_ROW, RESULTS_SIZE_COL).Value = "Size MB"
+    ws.Cells(RESULTS_HEADER_ROW, RESULTS_DATE_COL).Value = "Date Created"
+    ws.Cells(RESULTS_HEADER_ROW, RESULTS_DRIVE_COL).Value = "Drive Address"
+    ws.Cells(RESULTS_HEADER_ROW, RESULTS_FOLDER_COL).Value = "Folder Path"
+
+    With ws.Range(ws.Cells(firstRow, RESULTS_FILE_COL), ws.Cells(lastRow, RESULTS_FILE_COL))
+        .NumberFormat = "@"
+        .WrapText = False
+        .Font.Color = RGB(5, 99, 193)
+        .Font.Underline = xlUnderlineStyleSingle
+    End With
     With ws.Range(ws.Cells(firstRow, RESULTS_SIZE_COL), ws.Cells(lastRow, RESULTS_SIZE_COL))
         .NumberFormat = "0.00"
-        .HorizontalAlignment = xlRight
+        .WrapText = False
     End With
     With ws.Range(ws.Cells(firstRow, RESULTS_DATE_COL), ws.Cells(lastRow, RESULTS_DATE_COL))
         .NumberFormat = "yyyy-mmm-dd"
+        .WrapText = False
     End With
-    ws.Range(ws.Cells(firstRow, RESULTS_TYPE_COL), ws.Cells(lastRow, RESULTS_TYPE_COL)).HorizontalAlignment = xlCenter
+    With ws.Range(ws.Cells(firstRow, RESULTS_DRIVE_COL), ws.Cells(lastRow, RESULTS_FOLDER_COL_END))
+        .WrapText = False
+        .Font.ColorIndex = xlColorIndexAutomatic
+        .Font.Underline = xlUnderlineStyleNone
+    End With
 
     EnsureLinkColumnHidden ws
     EnsureResultsAutoFilter ws
 
     On Error Resume Next
     Application.StatusBar = False
-    Application.ScreenUpdating = screenPrev
-    Application.EnableEvents = eventsPrev
-    Application.Calculation = calcPrev
     On Error GoTo 0
-
-    ProtectDashboardResults
-
-    Debug.Print "INDEX CACHE: results grid built rows=" & CStr(RESULTS_MAX_ROWS) & _
-                " " & Format$(Timer - t0, "0.000") & "s"
+    Debug.Print "INDEX CACHE: results spill layout applied " & Format$(Timer - t0, "0.000") & "s"
 End Sub
 
-' Permanent AutoFilter on Type..Drive headers only (L:O).
-' Never attach filter to File A:K / Folder P:T — Excel corrupts those row merges into A8:A20007.
+Private Function ResultsSpillLayoutReady(ByVal ws As Worksheet, ByVal firstRow As Long, ByVal lastRow As Long) As Boolean
+    Dim lo As ListObject
+    On Error Resume Next
+    ResultsSpillLayoutReady = False
+    Set lo = ws.ListObjects(TABLE_RESULTS)
+    If Not lo Is Nothing Then Exit Function
+    If ws.Cells(RESULTS_HEADER_ROW, RESULTS_FILE_COL).MergeCells Then Exit Function
+    If ws.Cells(firstRow, RESULTS_FILE_COL).MergeCells Then Exit Function
+    If ws.Cells(lastRow, RESULTS_FILE_COL).MergeCells Then Exit Function
+    If ws.Cells(RESULTS_HEADER_ROW, RESULTS_FOLDER_COL).MergeCells Then Exit Function
+    If ws.Cells(firstRow, RESULTS_FOLDER_COL).MergeCells Then Exit Function
+    If ws.Cells(firstRow, RESULTS_FILE_COL).WrapText Then Exit Function
+    If StrComp(CStr(ws.Cells(RESULTS_HEADER_ROW, RESULTS_FILE_COL).Value & ""), "File", vbTextCompare) <> 0 Then Exit Function
+    If StrComp(CStr(ws.Cells(RESULTS_HEADER_ROW, RESULTS_TYPE_COL).Value & ""), "File Type", vbTextCompare) <> 0 Then Exit Function
+    If StrComp(CStr(ws.Cells(RESULTS_HEADER_ROW, RESULTS_FOLDER_COL).Value & ""), "Folder Path", vbTextCompare) <> 0 Then Exit Function
+    ResultsSpillLayoutReady = True
+    On Error GoTo 0
+End Function
+
+' AutoFilter on A:P so File and Folder Path can filter. Arrows only on
+' A / L / M / N / O / P — hide B:K so spill columns stay visually empty.
 Private Sub EnsureResultsAutoFilter(ByVal ws As Worksheet)
-    Dim hdr As Range
+    Dim lastRow As Long
+    Dim want As Range
+    Dim have As Range
+    Dim fieldCount As Long
+
     If ws Is Nothing Then Exit Sub
+    lastRow = RESULTS_HEADER_ROW + RESULTS_MAX_ROWS
+    fieldCount = RESULTS_FOLDER_COL - RESULTS_FILE_COL + 1
+    Set want = ws.Range(ws.Cells(RESULTS_HEADER_ROW, RESULTS_FILE_COL), _
+                        ws.Cells(lastRow, RESULTS_FOLDER_COL))
+
     On Error Resume Next
     If ws.AutoFilterMode Then
-        ' Already filtered on some range — leave layout alone
-        On Error GoTo 0
-        Exit Sub
+        Set have = ws.AutoFilter.Range
+        If Not have Is Nothing Then
+            If have.Row = RESULTS_HEADER_ROW _
+                    And have.Column = RESULTS_FILE_COL _
+                    And have.Columns.Count = fieldCount Then
+                HideSpillColumnFilterArrows ws, fieldCount
+                On Error GoTo 0
+                Exit Sub
+            End If
+        End If
+        If ws.FilterMode Then ws.ShowAllData
+        ws.AutoFilterMode = False
     End If
-    Set hdr = ws.Range(ws.Cells(RESULTS_HEADER_ROW, RESULTS_TYPE_COL), _
-                       ws.Cells(RESULTS_HEADER_ROW, RESULTS_DRIVE_COL))
-    hdr.AutoFilter
+    On Error GoTo 0
+
+    want.AutoFilter
+    HideSpillColumnFilterArrows ws, fieldCount
+End Sub
+
+Private Sub HideSpillColumnFilterArrows(ByVal ws As Worksheet, ByVal fieldCount As Long)
+    Dim field As Long
+    Dim lastHidden As Long
+
+    If ws Is Nothing Then Exit Sub
+    If Not ws.AutoFilterMode Then Exit Sub
+    lastHidden = RESULTS_TYPE_COL - RESULTS_FILE_COL
+    If lastHidden < 2 Then Exit Sub
+    If lastHidden > fieldCount Then lastHidden = fieldCount
+    On Error Resume Next
+    For field = 2 To lastHidden
+        ws.AutoFilter.Range.AutoFilter Field:=field, VisibleDropDown:=False
+    Next field
     On Error GoTo 0
 End Sub
 
-' Undo any active results filter so clears see all rows (does not re-apply filter).
 Public Sub ClearResultsAutoFilter(Optional ByVal ws As Worksheet = Nothing)
     If ws Is Nothing Then Set ws = Dashboard
     If ws Is Nothing Then Exit Sub
@@ -506,8 +557,7 @@ Public Sub ClearResultsAutoFilter(Optional ByVal ws As Worksheet = Nothing)
     On Error GoTo 0
 End Sub
 
-' On workbook open: drop leftover filter + prior search hits only.
-' Never rebuild merges, stripes, fonts, or alignment on the results table.
+' On workbook open: drop leftover table/filter + prior search hits; apply spill layout once.
 Public Sub ResetResultsAreaOnOpen()
     Dim ws As Worksheet
     Dim firstRow As Long
@@ -521,12 +571,14 @@ Public Sub ResetResultsAreaOnOpen()
     lastRow = firstRow + RESULTS_MAX_ROWS - 1
 
     ClearResultsAutoFilter ws
+    If Not ResultsSpillLayoutReady(ws, firstRow, lastRow) Then
+        ApplyResultsSpillLayout ws, firstRow, lastRow
+    End If
     ClearResultsDataArea ws, firstRow, lastRow
     EnsureResultsAutoFilter ws
     Debug.Print "INDEX CACHE: ResetResultsAreaOnOpen cleared filter + results"
 End Sub
 
-' Public clear used by search — same merge-safe path as open reset.
 Public Sub ClearResultsValues()
     Dim ws As Worksheet
     Dim firstRow As Long
@@ -538,16 +590,10 @@ Public Sub ClearResultsValues()
     ClearResultsDataArea ws, firstRow, lastRow
 End Sub
 
-' Clear values without touching Interior / Font / MergeArea.
-' Bulk ClearContents / Hyperlinks.Delete on A:T spanning row-merges can collapse File into A8:A20007.
+' No merges — bulk clear A:U is safe. B:K and Q:T must stay empty so File/Folder spill.
 Private Sub ClearResultsDataArea(ByVal ws As Worksheet, ByVal firstRow As Long, ByVal lastRow As Long)
     On Error Resume Next
-    ' Mid columns are single cells — safe to clear as a block
-    ws.Range(ws.Cells(firstRow, RESULTS_TYPE_COL), ws.Cells(lastRow, RESULTS_DRIVE_COL)).ClearContents
-    ' File / Folder: clear top-left of each row merge only (Value2, no format ops)
-    ws.Range(ws.Cells(firstRow, RESULTS_FILE_COL), ws.Cells(lastRow, RESULTS_FILE_COL)).Value2 = Empty
-    ws.Range(ws.Cells(firstRow, RESULTS_FOLDER_COL), ws.Cells(lastRow, RESULTS_FOLDER_COL)).Value2 = Empty
-    ws.Range(ws.Cells(firstRow, RESULTS_LINK_COL), ws.Cells(lastRow, RESULTS_LINK_COL)).ClearContents
+    ws.Range(ws.Cells(firstRow, RESULTS_FILE_COL), ws.Cells(lastRow, RESULTS_LINK_COL)).ClearContents
     ws.Range(ADDR_STAT_FILES_VAL).NumberFormat = "#,##0"
     ws.Range(ADDR_STAT_FOLDERS_VAL).NumberFormat = "#,##0"
     ws.Range(ADDR_STAT_SIZE_VAL).NumberFormat = "#,##0.00"
@@ -639,8 +685,7 @@ Private Sub ProtectDashboardSheet()
     UnprotectSheet ws
     On Error Resume Next
 
-    ' Results table stays unprotected so AutoFilter dropdowns work and users can
-    ' copy/edit; search can be re-run. Criteria still have list validation.
+    ' Dashboard stays unprotected so results copy/filter work and search can re-run.
     UnlockMergeOrRange ws, ADDR_TERM1
     UnlockMergeOrRange ws, ADDR_TERM2
     UnlockMergeOrRange ws, ADDR_SIZE_MB
@@ -661,7 +706,7 @@ Private Sub ProtectDashboardSheet()
     modEntryPoints.SetDashboardFixedWidth RESULTS_SIZE_COL, 10
     RestoreDashboardFixedColumnWidths ws
 
-    ' Filter only if missing — do not tear down/rebuild (corrupts File row merges)
+    ' Filter Type..Drive only if missing
     EnsureResultsAutoFilter ws
 
     ' Do not Protect the Dashboard — results AutoFilter/copy need an unlocked sheet.
@@ -731,7 +776,7 @@ Private Sub ApplySheetProtect(ByVal ws As Worksheet, Optional ByVal allowFormatt
 End Sub
 
 ' Fixed chrome columns (not user-resizable): A:G, H:J, L:N
-' G = Size MB (criteria) — snap back. K has no chrome — leave resizable.
+' G = Size MB (criteria) — snap back. K and P:T stay resizable so File/Folder can spill.
 Public Sub CaptureDashboardFixedColumnWidthsIfNeeded(ByVal ws As Worksheet)
     Dim c As Variant
     If ws Is Nothing Then Exit Sub
@@ -758,43 +803,6 @@ Public Sub RestoreDashboardFixedColumnWidths(ByVal ws As Worksheet)
             End If
         End If
     Next c
-    On Error GoTo 0
-End Sub
-
-Private Function ResultsGridLooksReady(ByVal ws As Worksheet, ByVal firstRow As Long, ByVal lastRow As Long) As Boolean
-    Dim needFileCols As Long
-    Dim needFolderCols As Long
-    Dim ma As Range
-
-    On Error Resume Next
-    ResultsGridLooksReady = False
-    needFileCols = RESULTS_FILE_COL_END - RESULTS_FILE_COL + 1
-    needFolderCols = RESULTS_FOLDER_COL_END - RESULTS_FOLDER_COL + 1
-
-    ' Require single-row A:K / P:T merges — a tall A8:K20000 still has Columns=11 and used to look "ready".
-    Set ma = ws.Cells(firstRow, RESULTS_FILE_COL).MergeArea
-    If ma.Columns.Count < needFileCols Or ma.Rows.Count <> 1 Then Exit Function
-    Set ma = ws.Cells(lastRow, RESULTS_FILE_COL).MergeArea
-    If ma.Columns.Count < needFileCols Or ma.Rows.Count <> 1 Then Exit Function
-    Set ma = ws.Cells(firstRow, RESULTS_FOLDER_COL).MergeArea
-    If ma.Columns.Count < needFolderCols Or ma.Rows.Count <> 1 Then Exit Function
-    Set ma = ws.Cells(lastRow, RESULTS_FOLDER_COL).MergeArea
-    If ma.Columns.Count < needFolderCols Or ma.Rows.Count <> 1 Then Exit Function
-
-    ResultsGridLooksReady = True
-End Function
-
-Private Sub SafeMerge(ByVal ws As Worksheet, ByVal row As Long, ByVal c1 As Long, ByVal c2 As Long)
-    Dim rng As Range
-    If ws Is Nothing Then Exit Sub
-    If c2 < c1 Then Exit Sub
-    On Error Resume Next
-    Set rng = ws.Range(ws.Cells(row, c1), ws.Cells(row, c2))
-    If rng.MergeCells Then
-        If rng.MergeArea.Address = rng.Address Then Exit Sub
-    End If
-    rng.UnMerge
-    rng.Merge
     On Error GoTo 0
 End Sub
 

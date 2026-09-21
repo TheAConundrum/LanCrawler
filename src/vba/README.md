@@ -78,7 +78,7 @@ AccDB crawls clear onboard `tblFiles` so leftover sheet rows cannot shadow AccDB
 | 3–6 | Options / stats chrome (right side; yours) |
 | 6 | Divider |
 | 7 | Results headers |
-| 8+ | Results data (macro-drawn; not an Excel ListObject) |
+| 8+ | Results data (File spills A:K; Folder Path spills P:T; wrap off, no merges) |
 
 Criteria (`A2:F5`): Order | Key Word | Operator | Key Word | Size | Size (MB)  
 Flexible match: label **`H3`**, value **`H4`**  
@@ -91,7 +91,7 @@ Drive filter: value **`H5`** — dropdown from the active backend’s distinct U
 
 Search stats: macro writes **`M3`** file count, **`M4`** folder count, **`M5`** total Size MB.
 
-Results: **A:K** File (blue; **double-click** opens folder) | **L** File Type | **M** Size MB | **N** Date Created | **O** Drive Address | **P:T** Folder Path | hidden **U** UNC target.
+Results: **A** File (blue; **double-click** opens folder; text spills across empty **B:K**) | **L** File Type | **M** Size MB | **N** Date Created | **O** Drive Address | **P** Folder Path (spills across empty **Q:T**) | hidden **U** UNC target. No merges, wrap off. AutoFilter covers **A:P**; arrows only on **A, L, M, N, O, P**.
 
 **UI lock:** free-text editable — Key Word **B**/**D** and Size MB **F** (rows 3–5). Dropdowns — Operator **C**, Size op **E**, Flexible **H4**, Search folders **I4**, Drive **H5**. **Database** is sheet-protected and **`xlSheetVeryHidden`**.
 
