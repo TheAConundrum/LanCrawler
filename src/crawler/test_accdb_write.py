@@ -13,12 +13,16 @@ if str(_SRC) not in sys.path:
 from crawler.crawl import (  # noqa: E402
     IndexRow,
     _ace_schema_col_type,
+    _ace_text_from_clauses,
+    _accdb_write_workers,
     _chunked_delete_under_root,
     _delete_under_root,
     _executemany_committed,
     _insert_accdb_records,
     _is_ace_lock_count_error,
+    _open_accdb,
     _raise_ace_max_locks,
+    _split_even_slices,
     _write_ace_schema_ini,
     _write_ace_tab_file,
     write_accdb,
@@ -189,6 +193,13 @@ class AccdbTextImportHelperTests(unittest.TestCase):
             ini = (folder / "schema.ini").read_text(encoding="utf-8")
             self.assertIn("Format=TabDelimited", ini)
             self.assertIn("Col1=FilePath Memo", ini)
+            self.assertIn("Col2=FileDate Text Width 32", ini)
+            self.assertIn("Col4=EntryType Text Width 16", ini)
+
+    def test_text_from_clause_uses_filename_not_only_hash(self) -> None:
+        clauses = _ace_text_from_clauses(Path(r"C:\Temp\load"), "load_0000.txt")
+        self.assertTrue(any("].[load_0000.txt]" in c for c in clauses))
+        self.assertTrue(any("].[load_0000#txt]" in c for c in clauses))
 
     def test_text_import_failure_falls_back_to_row_inserts(self) -> None:
         class _Cursor:
@@ -214,6 +225,22 @@ class AccdbTextImportHelperTests(unittest.TestCase):
         )
         self.assertEqual(cur.inserted, 3)
 
+    def test_split_even_slices_covers_all(self) -> None:
+        items = list(range(10))
+        parts = _split_even_slices(items, 3)
+        self.assertEqual(len(parts), 3)
+        self.assertEqual([x for part in parts for x in part], items)
+        self.assertTrue(all(part for part in parts))
+        self.assertEqual(_split_even_slices([], 4), [])
+
+    def test_write_workers_small_stays_single_process(self) -> None:
+        self.assertEqual(_accdb_write_workers(50), 1)
+        self.assertEqual(_accdb_write_workers(5_000_000, override=1), 1)
+        self.assertEqual(_accdb_write_workers(5_000_000, override=8), 8)
+        auto = _accdb_write_workers(5_000_000)
+        self.assertGreaterEqual(auto, 1)
+        self.assertLessEqual(auto, 12)
+
 
 class AccdbWriteIntegrationTests(unittest.TestCase):
     def test_replace_root_past_default_lock_limit(self) -> None:
@@ -238,7 +265,58 @@ class AccdbWriteIntegrationTests(unittest.TestCase):
             except RuntimeError as exc:
                 self.skipTest(str(exc))
             self.assertTrue(accdb.is_file())
+            conn = _open_accdb(accdb)
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT COUNT(*) FROM tblFiles")
+                counted = cur.fetchone()
+                self.assertIsNotNone(counted)
+                assert counted is not None
+                self.assertEqual(int(counted[0]), n)
+            finally:
+                conn.close()
+
+    def test_parallel_shard_merge_keeps_row_count(self) -> None:
+        n = 4_000
+        root = r"\\sisl-fs2\kearl_public$"
+        rows = [
+            IndexRow(
+                path=rf"{root}\folder_{i:05d}\file.txt",
+                file_date="2026-09-20",
+                size_mb=0.01,
+                entry_type="FILE",
+                mtime_ts=1.0,
+                size_bytes=100,
+            )
+            for i in range(n)
+        ]
+        with tempfile.TemporaryDirectory() as raw:
+            accdb = Path(raw) / "SearchIndex-9-23-2026.accdb"
+            try:
+                write_accdb(
+                    rows,
+                    accdb,
+                    crawl_root=root,
+                    replace_root=True,
+                    write_workers=2,
+                )
+            except RuntimeError as exc:
+                self.skipTest(str(exc))
+            self.assertTrue(accdb.is_file())
+            conn = _open_accdb(accdb)
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT COUNT(*) FROM tblFiles")
+                counted = cur.fetchone()
+                self.assertIsNotNone(counted)
+                assert counted is not None
+                self.assertEqual(int(counted[0]), n)
+            finally:
+                conn.close()
 
 
 if __name__ == "__main__":
+    import multiprocessing
+
+    multiprocessing.freeze_support()
     unittest.main()

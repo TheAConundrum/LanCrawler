@@ -7,7 +7,10 @@ from __future__ import annotations
 import csv
 import datetime as dt
 import errno
+import multiprocessing
 import os
+import pickle
+import queue as queue_mod
 import re
 import shutil
 import struct
@@ -33,13 +36,18 @@ DEFAULT_WORKBOOK_NAME = "Lan_Search_Tool.xlsm"
 ACCDB_ROW_THRESHOLD = 750_000
 # Prefer August-era bulk writes. ACE default MaxLocksPerFile is 9500; we raise it
 # in-process and only shrink batches if a lock-count error still fires.
-ACCDB_WRITE_BATCH = 2000
+ACCDB_WRITE_BATCH = 4000
 ACCDB_DELETE_CHUNK = 4000
-# ACE text-ISAM import chunks (INSERT…SELECT from a tab file). Smaller than a
-# full 3M-row statement so MaxLocksPerFile does not trip; larger than ODBC row inserts.
-ACCDB_TEXT_IMPORT_CHUNK = 80_000
+# ACE text-ISAM import chunks (INSERT…SELECT from a tab file). Must run via
+# DAO/OLEDB — Access ODBC cannot query the Text ISAM in the same connection.
+ACCDB_TEXT_IMPORT_CHUNK = 200_000
+# Parallel ACE engines (one AccDB per process), then INSERT…SELECT merge.
+# Access will not write the same file from multiple threads; shards are required.
+ACCDB_SHARD_MIN_ROWS = 100_000
+ACCDB_MAX_WRITE_WORKERS = 12
 _DAO_DB_MAX_LOCKS_PER_FILE = 8
-_ACE_MAX_LOCKS_PER_FILE = 200_000
+_DAO_DB_FAIL_ON_ERROR = 128
+_ACE_MAX_LOCKS_PER_FILE = 1_000_000
 
 try:
     from .filters import (
@@ -1306,20 +1314,28 @@ def _safe_rollback(conn) -> None:
         pass
 
 
-def _raise_ace_max_locks(max_locks: int = _ACE_MAX_LOCKS_PER_FILE) -> None:
-    """Override ACE MaxLocksPerFile in-process (no registry write)."""
+def _dao_engine(max_locks: int = _ACE_MAX_LOCKS_PER_FILE) -> Any | None:
+    """ACE DAO workspace with MaxLocksPerFile raised on this engine instance."""
     try:
         import win32com.client  # type: ignore
     except ImportError:
-        return
+        return None
     for progid in ("DAO.DBEngine.120", "DAO.DBEngine.160", "DAO.DBEngine.36"):
         try:
-            win32com.client.Dispatch(progid).SetOption(
-                _DAO_DB_MAX_LOCKS_PER_FILE, int(max_locks)
-            )
-            return
+            engine = win32com.client.Dispatch(progid)
+            try:
+                engine.SetOption(_DAO_DB_MAX_LOCKS_PER_FILE, int(max_locks))
+            except Exception:  # noqa: BLE001
+                pass
+            return engine
         except Exception:  # noqa: BLE001
             continue
+    return None
+
+
+def _raise_ace_max_locks(max_locks: int = _ACE_MAX_LOCKS_PER_FILE) -> None:
+    """Override ACE MaxLocksPerFile in-process (no registry write)."""
+    _dao_engine(max_locks)
 
 
 def _create_accdb_index(cur, conn, index_name: str, table_name: str, column: str) -> None:
@@ -1362,6 +1378,40 @@ def _drop_accdb_table(cur, conn, table_name: str) -> None:
         _safe_rollback(conn)
 
 
+def _is_fast_executemany_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return any(
+        token in text
+        for token in (
+            "invalid precision",
+            "sqlbindparameter",
+            "hy104",
+            "07002",
+            "string data, right truncation",
+            "optional feature not implemented",
+        )
+    )
+
+
+def _set_fast_executemany(conn, enabled: bool) -> bool:
+    if conn is None or not hasattr(conn, "fast_executemany"):
+        return False
+    try:
+        conn.fast_executemany = bool(enabled)
+        return bool(enabled)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _fmt_eta(seconds: float) -> str:
+    sec = max(0, int(seconds))
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h {m:02d}m"
+    return f"{m}m {s:02d}s"
+
+
 def _executemany_committed(
     cur,
     conn,
@@ -1378,6 +1428,8 @@ def _executemany_committed(
     i = 0
     n = len(records)
     last_note = 0
+    using_fast = _set_fast_executemany(conn, True)
+    t0 = time.time()
     while i < n:
         chunk = records[i : i + size]
         try:
@@ -1385,10 +1437,20 @@ def _executemany_committed(
             conn.commit()
             i += len(chunk)
             if on_progress is not None and (i == n or i - last_note >= max(size * 5, 1)):
-                on_progress(f"    AccDB inserted {i:,} / {n:,}")
+                elapsed = max(time.time() - t0, 0.001)
+                rate = i / elapsed
+                eta = _fmt_eta((n - i) / max(rate, 0.001))
+                on_progress(
+                    f"    AccDB inserted {i:,} / {n:,} ({rate:,.0f} rows/s, ~{eta} left)"
+                )
                 last_note = i
         except Exception as exc:  # noqa: BLE001
             _safe_rollback(conn)
+            if using_fast and _is_fast_executemany_error(exc):
+                using_fast = _set_fast_executemany(conn, False)
+                if on_progress is not None:
+                    on_progress("    AccDB fast_executemany failed — retrying standard batches")
+                continue
             if _is_ace_lock_count_error(exc) and size > 1:
                 size = max(1, size // 2)
                 if on_progress is not None:
@@ -1416,17 +1478,39 @@ def _ace_schema_col_type(column: str) -> str:
     return "Text"
 
 
-def _ace_text_table_ref(folder: Path, filename: str) -> str:
-    db = str(folder).replace("/", "\\")
+def _ace_schema_col_decl(column: str) -> str:
+    typ = _ace_schema_col_type(column)
+    key = column.strip().lower()
+    if typ != "Text":
+        return f"{column} {typ}"
+    if key in {"filedate", "createddate"}:
+        return f"{column} Text Width 32"
+    if key == "entrytype":
+        return f"{column} Text Width 16"
+    return f"{column} Text Width 255"
+
+
+def _ace_text_from_clauses(folder: Path, filename: str) -> list[str]:
+    """Access SQL FROM clauses for a schema.ini text file (ODBC and OLEDB forms)."""
+    db = str(Path(folder).resolve()).replace("/", "\\")
     if not db.endswith("\\"):
         db += "\\"
     stem, dot, ext = filename.rpartition(".")
-    if not dot:
-        stem, ext = filename, "txt"
-    return (
-        f"[Text;HDR=Yes;FMT=Delimited;CharacterSet=Unicode;Database={db}]"
-        f".[{stem}#{ext}]"
-    )
+    clauses = [
+        f"[Text;HDR=Yes;FMT=TabDelimited;CharacterSet=Unicode;DATABASE={db}].[{filename}]",
+        f"[Text;HDR=Yes;FMT=Delimited;CharacterSet=Unicode;DATABASE={db}].[{filename}]",
+        f"[Text;HDR=Yes;DATABASE={db}].[{filename}]",
+    ]
+    if dot:
+        clauses.append(
+            f"[Text;HDR=Yes;FMT=TabDelimited;CharacterSet=Unicode;DATABASE={db}]"
+            f".[{stem}#{ext}]"
+        )
+        clauses.append(
+            f"[Text;HDR=Yes;FMT=Delimited;CharacterSet=Unicode;Database={db}]"
+            f".[{stem}#{ext}]"
+        )
+    return clauses
 
 
 def _write_ace_schema_ini(folder: Path, filename: str, columns: list[str]) -> None:
@@ -1438,7 +1522,7 @@ def _write_ace_schema_ini(folder: Path, filename: str, columns: list[str]) -> No
         "CharacterSet=Unicode",
     ]
     for i, col in enumerate(columns, start=1):
-        lines.append(f"Col{i}={col} {_ace_schema_col_type(col)}")
+        lines.append(f"Col{i}={_ace_schema_col_decl(col)}")
     (folder / "schema.ini").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -1457,11 +1541,357 @@ def _format_ace_text_value(value: object) -> str:
 def _write_ace_tab_file(
     path: Path, columns: list[str], records: list[tuple[Any, ...]]
 ) -> None:
+    # Raw tabs (no csv quoting). ACE TabDelimited does not speak Excel-CSV quotes.
     with path.open("w", encoding="utf-16", newline="") as handle:
-        writer = csv.writer(handle, dialect="excel-tab", lineterminator="\r\n")
-        writer.writerow(columns)
+        handle.write("\t".join(columns) + "\r\n")
         for rec in records:
-            writer.writerow([_format_ace_text_value(v) for v in rec])
+            handle.write("\t".join(_format_ace_text_value(v) for v in rec) + "\r\n")
+
+
+def _close_dao_db(db: Any) -> None:
+    try:
+        db.Close()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _execute_sql_via_dao(accdb_path: Path, sql: str) -> None:
+    engine = _dao_engine()
+    if engine is None:
+        raise RuntimeError("DAO ACE engine not available")
+    path = str(Path(accdb_path).resolve())
+    db = None
+    last_err: Exception | None = None
+    for exclusive in (True, False):
+        try:
+            db = engine.OpenDatabase(path, exclusive, False)
+            break
+        except Exception as exc:  # noqa: BLE001
+            last_err = exc
+            db = None
+    if db is None:
+        raise RuntimeError(f"DAO could not open AccDB: {last_err}") from last_err
+    try:
+        db.Execute(sql, _DAO_DB_FAIL_ON_ERROR)
+    finally:
+        _close_dao_db(db)
+
+
+def _execute_sql_via_oledb(accdb_path: Path, sql: str) -> None:
+    try:
+        import win32com.client  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError("pywin32 is required for ACE OLEDB import") from exc
+    path = str(Path(accdb_path).resolve())
+    last_err: Exception | None = None
+    for provider in ("Microsoft.ACE.OLEDB.16.0", "Microsoft.ACE.OLEDB.12.0"):
+        conn = None
+        try:
+            conn = win32com.client.Dispatch("ADODB.Connection")
+            conn.Open(f"Provider={provider};Data Source={path};")
+            conn.Execute(sql)
+            return
+        except Exception as exc:  # noqa: BLE001
+            last_err = exc
+        finally:
+            if conn is not None:
+                try:
+                    conn.Close()
+                except Exception:  # noqa: BLE001
+                    pass
+    raise RuntimeError(f"OLEDB text import failed: {last_err}") from last_err
+
+
+def _split_even_slices(items: list[Any], n: int) -> list[list[Any]]:
+    """Split items into up to n contiguous non-empty slices."""
+    if not items:
+        return []
+    parts = max(1, min(int(n), len(items)))
+    size, extra = divmod(len(items), parts)
+    out: list[list[Any]] = []
+    i = 0
+    for k in range(parts):
+        take = size + (1 if k < extra else 0)
+        if take <= 0:
+            continue
+        out.append(items[i : i + take])
+        i += take
+    return out
+
+
+def _accdb_write_workers(n_records: int, override: int | None = None) -> int:
+    """How many ACE processes to use for a bulk insert."""
+    if override is not None:
+        return max(1, int(override))
+    env = os.environ.get("LAN_ACCDB_WRITE_WORKERS", "").strip()
+    if env.isdigit():
+        return max(1, int(env))
+    n = max(0, int(n_records))
+    if n < ACCDB_SHARD_MIN_ROWS:
+        return 1
+    cpu = os.cpu_count() or 2
+    by_rows = max(1, n // ACCDB_SHARD_MIN_ROWS)
+    return max(1, min(int(cpu), by_rows, ACCDB_MAX_WRITE_WORKERS))
+
+
+def _ace_external_accdb_from_clauses(shard_path: Path, table_name: str) -> list[str]:
+    path = str(Path(shard_path).resolve()).replace("'", "''")
+    return [
+        f"[{table_name}] IN '{path}'",
+        f"[;DATABASE={path}].[{table_name}]",
+        f"[MS Access;DATABASE={path}].[{table_name}]",
+    ]
+
+
+def _wait_laccdb_gone(accdb_path: Path, timeout: float = 20.0) -> None:
+    lock = Path(accdb_path).with_suffix(".laccdb")
+    t0 = time.time()
+    while lock.is_file() and (time.time() - t0) < timeout:
+        time.sleep(0.15)
+
+
+def _run_accdb_shard_job(payload: dict[str, Any], on_progress: ProgressCb | None) -> int:
+    """Child-process job: create a temp AccDB and text-import one slice of rows."""
+    shard_path = Path(str(payload["shard_path"]))
+    table_name = str(payload["table_name"])
+    columns = [str(c) for c in payload["columns"]]
+    records_path = Path(str(payload["records_path"]))
+    with records_path.open("rb") as handle:
+        records = pickle.load(handle)
+    try:
+        records_path.unlink()
+    except OSError:
+        pass
+    if not isinstance(records, list):
+        raise TypeError(f"shard payload is {type(records)!r}, expected list")
+    _create_empty_accdb(shard_path)
+    conn = _open_accdb(shard_path)
+    try:
+        cur = conn.cursor()
+        _ensure_accdb_tables(cur, conn, with_indexes=False)
+        conn.commit()
+    finally:
+        conn.close()
+    _insert_via_ace_text(
+        None,
+        None,
+        table_name=table_name,
+        columns=columns,
+        records=records,
+        on_progress=on_progress,
+        accdb_path=shard_path,
+    )
+    return len(records)
+
+
+def _merge_shards_via_dao(
+    dest_path: Path,
+    shards: list[Path],
+    *,
+    table_name: str,
+    columns: list[str],
+    on_progress: ProgressCb | None = None,
+) -> None:
+    col_sql = ", ".join(f"[{c}]" for c in columns)
+    engine = _dao_engine()
+    if engine is None:
+        raise RuntimeError("DAO ACE engine not available")
+    dest = str(Path(dest_path).resolve())
+    db = None
+    last_open: Exception | None = None
+    for exclusive in (True, False):
+        try:
+            db = engine.OpenDatabase(dest, exclusive, False)
+            break
+        except Exception as exc:  # noqa: BLE001
+            last_open = exc
+            db = None
+    if db is None:
+        raise RuntimeError(f"DAO could not open AccDB to merge shards: {last_open}") from last_open
+    try:
+        for i, shard in enumerate(shards, start=1):
+            last_err: Exception | None = None
+            merged = False
+            for clause in _ace_external_accdb_from_clauses(shard, table_name):
+                sql = (
+                    f"INSERT INTO [{table_name}] ({col_sql}) "
+                    f"SELECT {col_sql} FROM {clause}"
+                )
+                try:
+                    db.Execute(sql, _DAO_DB_FAIL_ON_ERROR)
+                    merged = True
+                    last_err = None
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    last_err = exc
+            if not merged:
+                raise RuntimeError(
+                    f"Could not merge {shard.name} into {dest_path.name}: {last_err}"
+                ) from last_err
+            if on_progress is not None:
+                on_progress(f"    AccDB merged shard {i:,} / {len(shards):,} into {table_name}")
+    finally:
+        _close_dao_db(db)
+
+
+def _insert_via_parallel_ace_text(
+    *,
+    table_name: str,
+    columns: list[str],
+    records: list[tuple[Any, ...]],
+    accdb_path: Path,
+    on_progress: ProgressCb | None = None,
+    write_workers: int | None = None,
+) -> None:
+    """N ACE processes each load a shard AccDB, then merge into dest (DAO IN clause)."""
+    workers = _accdb_write_workers(len(records), write_workers)
+    if workers <= 1:
+        _insert_via_ace_text(
+            None,
+            None,
+            table_name=table_name,
+            columns=columns,
+            records=records,
+            on_progress=on_progress,
+            accdb_path=accdb_path,
+        )
+        return
+
+    slices = _split_even_slices(records, workers)
+    workers = len(slices)
+    if workers <= 1:
+        _insert_via_ace_text(
+            None,
+            None,
+            table_name=table_name,
+            columns=columns,
+            records=records,
+            on_progress=on_progress,
+            accdb_path=accdb_path,
+        )
+        return
+
+    try:
+        from crawler.accdb_shard import run_shard
+    except ImportError:
+        from accdb_shard import run_shard  # type: ignore
+
+    tmp = Path(tempfile.mkdtemp(prefix="lan_accdb_shards_"))
+    procs: list[multiprocessing.Process] = []
+    shard_paths: list[Path] = []
+
+    ctx = multiprocessing.get_context("spawn")
+    progress_q: Any = ctx.Queue()
+    if on_progress is not None:
+        on_progress(
+            f"    AccDB parallel load: {workers} processes × ~"
+            f"{len(records) // workers:,} rows into {table_name}"
+        )
+    try:
+        for i, recs in enumerate(slices):
+            shard_path = tmp / f"shard_{i:02d}.accdb"
+            records_path = tmp / f"shard_{i:02d}.pkl"
+            with records_path.open("wb") as handle:
+                pickle.dump(recs, handle, protocol=pickle.HIGHEST_PROTOCOL)
+            shard_paths.append(shard_path)
+            payload = {
+                "shard_path": str(shard_path),
+                "table_name": table_name,
+                "columns": columns,
+                "records_path": str(records_path),
+                "shard_index": i,
+                "worker_total": workers,
+            }
+            proc = ctx.Process(
+                target=run_shard,
+                args=(payload, progress_q),
+                name=f"lan-accdb-shard-{i}",
+                daemon=False,
+            )
+            procs.append(proc)
+            proc.start()
+        del slices
+
+        errors: list[str] = []
+        finished = 0
+        t0 = time.time()
+
+        def _handle_msg(kind: object, payload: object) -> None:
+            nonlocal finished
+            if kind == "log":
+                if on_progress is not None:
+                    on_progress(f"    {payload}")
+            elif kind == "ok":
+                finished += 1
+                if on_progress is not None:
+                    elapsed = max(time.time() - t0, 0.001)
+                    on_progress(
+                        f"    AccDB shard ready {finished}/{workers} "
+                        f"({int(payload):,} rows, {elapsed:.1f}s)"
+                    )
+            elif kind == "err":
+                finished += 1
+                errors.append(str(payload))
+                if on_progress is not None:
+                    on_progress(f"    AccDB shard failed: {payload}")
+
+        while finished < workers:
+            alive = any(p.is_alive() for p in procs)
+            try:
+                kind, _idx, payload = progress_q.get(timeout=1.0)
+            except queue_mod.Empty:
+                if not alive:
+                    break
+                continue
+            _handle_msg(kind, payload)
+        while True:
+            try:
+                kind, _idx, payload = progress_q.get_nowait()
+            except queue_mod.Empty:
+                break
+            _handle_msg(kind, payload)
+
+        for proc in procs:
+            proc.join(timeout=60)
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=10)
+            if proc.exitcode not in (0, None) and not errors:
+                errors.append(f"{proc.name} exit {proc.exitcode}")
+
+        if errors:
+            raise _AceTextImportError("; ".join(errors), started=False)
+        if finished < workers:
+            raise _AceTextImportError(
+                f"AccDB shard workers stopped early ({finished}/{workers})",
+                started=False,
+            )
+
+        for shard in shard_paths:
+            if not shard.is_file():
+                raise _AceTextImportError(f"shard missing: {shard.name}", started=False)
+            _wait_laccdb_gone(shard)
+        try:
+            _merge_shards_via_dao(
+                accdb_path,
+                shard_paths,
+                table_name=table_name,
+                columns=columns,
+                on_progress=on_progress,
+            )
+        except _AceTextImportError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise _AceTextImportError(str(exc), started=True) from exc
+    except BaseException:
+        for proc in procs:
+            if proc.is_alive():
+                proc.terminate()
+        for proc in procs:
+            proc.join(timeout=5)
+        raise
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def _insert_via_ace_text(
@@ -1472,15 +1902,42 @@ def _insert_via_ace_text(
     columns: list[str],
     records: list[tuple[Any, ...]],
     on_progress: ProgressCb | None = None,
+    accdb_path: Path | None = None,
 ) -> None:
-    """INSERT…SELECT from UTF-16 tab files (ACE text ISAM). Much faster than ODBC row inserts."""
+    """INSERT…SELECT from UTF-16 tab files via DAO/OLEDB (Access ODBC cannot do this)."""
     if not records:
         return
     col_sql = ", ".join(f"[{c}]" for c in columns)
     tmp = Path(tempfile.mkdtemp(prefix="lan_accdb_load_"))
     committed = 0
     chunk_size = max(1, int(ACCDB_TEXT_IMPORT_CHUNK))
+    backend_name = ""
+    style_idx: int | None = None
+    t0 = time.time()
+    if on_progress is not None:
+        on_progress(
+            f"    AccDB bulk-loading {len(records):,} rows into {table_name} via ACE text import ..."
+        )
+
+    def _executors() -> list[tuple[str, Callable[[str], None]]]:
+        found: list[tuple[str, Callable[[str], None]]] = []
+        if accdb_path is not None:
+            found.append(("DAO", lambda sql: _execute_sql_via_dao(accdb_path, sql)))
+            found.append(("OLEDB", lambda sql: _execute_sql_via_oledb(accdb_path, sql)))
+        elif cur is not None:
+
+            def _via_cursor(sql: str) -> None:
+                cur.execute(sql)
+                if conn is not None:
+                    conn.commit()
+
+            found.append(("ODBC", _via_cursor))
+        if not found:
+            raise _AceTextImportError("No AccDB execute backend", started=False)
+        return found
+
     try:
+        executors = _executors()
         i = 0
         n = len(records)
         file_idx = 0
@@ -1489,29 +1946,66 @@ def _insert_via_ace_text(
             fname = f"load_{file_idx:04d}.txt"
             _write_ace_tab_file(tmp / fname, columns, chunk)
             _write_ace_schema_ini(tmp, fname, columns)
-            sql = (
-                f"INSERT INTO [{table_name}] ({col_sql}) "
-                f"SELECT {col_sql} FROM {_ace_text_table_ref(tmp, fname)}"
-            )
-            try:
-                cur.execute(sql)
-                conn.commit()
-            except Exception as exc:  # noqa: BLE001
-                _safe_rollback(conn)
-                if _is_ace_lock_count_error(exc) and chunk_size > 1:
-                    chunk_size = max(1, chunk_size // 2)
-                    if on_progress is not None:
-                        on_progress(
-                            f"    AccDB lock limit — retrying text import in chunks of "
-                            f"{chunk_size:,}"
-                        )
+            clauses = _ace_text_from_clauses(tmp, fname)
+            order = list(range(len(clauses)))
+            if style_idx is not None:
+                order = [style_idx] + [idx for idx in order if idx != style_idx]
+            last_err: Exception | None = None
+            imported = False
+            lock_backoff = False
+            for exec_name, execute in executors:
+                if backend_name and exec_name != backend_name:
                     continue
-                raise _AceTextImportError(str(exc), started=committed > 0) from exc
+                for idx in order:
+                    sql = (
+                        f"INSERT INTO [{table_name}] ({col_sql}) "
+                        f"SELECT {col_sql} FROM {clauses[idx]}"
+                    )
+                    try:
+                        execute(sql)
+                        backend_name = exec_name
+                        style_idx = idx
+                        imported = True
+                        last_err = None
+                        break
+                    except Exception as exc:  # noqa: BLE001
+                        if conn is not None:
+                            _safe_rollback(conn)
+                        if _is_ace_lock_count_error(exc) and chunk_size > 1:
+                            chunk_size = max(1, chunk_size // 2)
+                            if on_progress is not None:
+                                on_progress(
+                                    f"    AccDB lock limit — retrying text import in chunks of "
+                                    f"{chunk_size:,}"
+                                )
+                            lock_backoff = True
+                            last_err = None
+                            break
+                        last_err = exc
+                if imported or lock_backoff:
+                    break
+            if lock_backoff:
+                continue
+            if not imported:
+                if backend_name:
+                    backend_name = ""
+                    style_idx = None
+                    continue
+                raise _AceTextImportError(
+                    str(last_err) if last_err is not None else "ACE text import failed",
+                    started=committed > 0,
+                ) from last_err
             committed += len(chunk)
             i += len(chunk)
             file_idx += 1
             if on_progress is not None:
-                on_progress(f"    AccDB imported {committed:,} / {n:,} into {table_name}")
+                elapsed = max(time.time() - t0, 0.001)
+                rate = committed / elapsed
+                eta = _fmt_eta((n - committed) / max(rate, 0.001))
+                on_progress(
+                    f"    AccDB imported {committed:,} / {n:,} into {table_name} "
+                    f"via {backend_name} ({rate:,.0f} rows/s, ~{eta} left)"
+                )
             try:
                 (tmp / fname).unlink()
             except OSError:
@@ -1529,27 +2023,79 @@ def _insert_accdb_records(
     records: list[tuple[Any, ...]],
     insert_sql: str,
     on_progress: ProgressCb | None = None,
+    accdb_path: Path | None = None,
+    write_workers: int | None = None,
 ) -> None:
     if not records:
         return
-    try:
-        _insert_via_ace_text(
-            cur,
-            conn,
-            table_name=table_name,
-            columns=columns,
-            records=records,
-            on_progress=on_progress,
-        )
-        return
-    except _AceTextImportError as exc:
-        if exc.started:
-            raise
-        if on_progress is not None:
-            on_progress(
-                f"    AccDB text import unavailable ({exc}); using row inserts"
+    if accdb_path is not None:
+        try:
+            _insert_via_parallel_ace_text(
+                table_name=table_name,
+                columns=columns,
+                records=records,
+                accdb_path=accdb_path,
+                on_progress=on_progress,
+                write_workers=write_workers,
             )
-    _executemany_committed(cur, conn, insert_sql, records, on_progress=on_progress)
+            return
+        except _AceTextImportError as exc:
+            if exc.started:
+                raise
+            if on_progress is not None:
+                on_progress(
+                    f"    AccDB parallel/text import unavailable ({exc}); "
+                    "trying single-process text import"
+                )
+            try:
+                _insert_via_ace_text(
+                    cur,
+                    conn,
+                    table_name=table_name,
+                    columns=columns,
+                    records=records,
+                    on_progress=on_progress,
+                    accdb_path=accdb_path,
+                )
+                return
+            except _AceTextImportError as exc2:
+                if exc2.started:
+                    raise
+                if on_progress is not None:
+                    on_progress(
+                        f"    AccDB text import unavailable ({exc2}); using row inserts"
+                    )
+    else:
+        try:
+            _insert_via_ace_text(
+                cur,
+                conn,
+                table_name=table_name,
+                columns=columns,
+                records=records,
+                on_progress=on_progress,
+                accdb_path=accdb_path,
+            )
+            return
+        except _AceTextImportError as exc:
+            if exc.started:
+                raise
+            if on_progress is not None:
+                on_progress(
+                    f"    AccDB text import unavailable ({exc}); using row inserts"
+                )
+    own_conn = False
+    if cur is None or conn is None:
+        if accdb_path is None:
+            raise RuntimeError("AccDB insert needs a connection or path")
+        conn = _open_accdb(accdb_path)
+        cur = conn.cursor()
+        own_conn = True
+    try:
+        _executemany_committed(cur, conn, insert_sql, records, on_progress=on_progress)
+    finally:
+        if own_conn:
+            conn.close()
 
 
 def _chunked_delete_by_paths(
@@ -1674,7 +2220,7 @@ def _ensure_accdb_tables(cur, conn, *, with_indexes: bool = True) -> None:
         cur.execute(
             """
             CREATE TABLE tblFiles (
-                FilePath TEXT NOT NULL,
+                FilePath MEMO NOT NULL,
                 FileDate TEXT,
                 SizeMB DOUBLE NOT NULL,
                 EntryType TEXT NOT NULL
@@ -1687,7 +2233,7 @@ def _ensure_accdb_tables(cur, conn, *, with_indexes: bool = True) -> None:
         cur.execute(
             """
             CREATE TABLE tblFolderMeta (
-                FolderPath TEXT NOT NULL,
+                FolderPath MEMO NOT NULL,
                 DirMtime DOUBLE,
                 LocalBytes DOUBLE,
                 CreatedDate TEXT
@@ -1714,6 +2260,18 @@ def _ensure_accdb_tables(cur, conn, *, with_indexes: bool = True) -> None:
         _ensure_accdb_indexes(cur, conn)
 
 
+def _widen_path_columns(cur, conn) -> None:
+    """Long UNC paths overflow Access TEXT(255); MEMO is required for text-ISAM import."""
+    for table_name, column in (("tblFiles", "FilePath"), ("tblFolderMeta", "FolderPath")):
+        if not _accdb_table_exists(cur, table_name):
+            continue
+        try:
+            cur.execute(f"ALTER TABLE [{table_name}] ALTER COLUMN [{column}] MEMO")
+            conn.commit()
+        except Exception:  # noqa: BLE001
+            _safe_rollback(conn)
+
+
 def _open_accdb(out_path: Path) -> Any:
     """Open AccDB via pyodbc, else ACE OLEDB. Caller must close."""
     _raise_ace_max_locks()
@@ -1728,8 +2286,6 @@ def _open_accdb(out_path: Path) -> Any:
     for conn_str in _accdb_connection_strings(out_path):
         try:
             conn: Any = pyodbc.connect(conn_str, autocommit=False)
-            if hasattr(conn, "fast_executemany"):
-                conn.fast_executemany = False
             return conn
         except Exception as exc:  # noqa: BLE001
             last_err = exc
@@ -1833,7 +2389,9 @@ def _delete_folder_meta_under_root(
 
 
 def _insert_folder_meta_rows(
-    cur, conn, rows: list[IndexRow], *, on_progress: ProgressCb | None = None
+    cur, conn, rows: list[IndexRow], *, on_progress: ProgressCb | None = None,
+    accdb_path: Path | None = None,
+    write_workers: int | None = None,
 ) -> None:
     folders = [r for r in rows if r.entry_type == ENTRY_FOLDER]
     if not folders:
@@ -1860,6 +2418,8 @@ def _insert_folder_meta_rows(
         records=records,
         insert_sql=insert_sql,
         on_progress=on_progress,
+        accdb_path=accdb_path,
+        write_workers=write_workers,
     )
 
 
@@ -1963,7 +2523,9 @@ def _rewrite_accdb_ingest_log(cur, conn, log_rows: list[IngestLogRow]) -> None:
 
 
 def _insert_accdb_file_rows(
-    cur, conn, rows: list[IndexRow], *, on_progress: ProgressCb | None = None
+    cur, conn, rows: list[IndexRow], *, on_progress: ProgressCb | None = None,
+    accdb_path: Path | None = None,
+    write_workers: int | None = None,
 ) -> None:
     insert_sql = (
         "INSERT INTO tblFiles (FilePath, FileDate, SizeMB, EntryType) VALUES (?, ?, ?, ?)"
@@ -1980,6 +2542,8 @@ def _insert_accdb_file_rows(
         records=records,
         insert_sql=insert_sql,
         on_progress=on_progress,
+        accdb_path=accdb_path,
+        write_workers=write_workers,
     )
 
 
@@ -1991,6 +2555,7 @@ def write_accdb(
     ingest_log: list[IngestLogRow] | None = None,
     replace_root: bool = True,
     on_progress: ProgressCb | None = None,
+    write_workers: int | None = None,
 ) -> None:
     """
     Write crawl rows into AccDB tblFiles and accumulate scan roots in tblIngested.
@@ -2031,8 +2596,34 @@ def write_accdb(
         _ensure_accdb_tables(cur, conn, with_indexes=False)
         note("  AccDB dropping indexes for bulk load ...")
         _drop_accdb_bulk_indexes(cur, conn)
+        _widen_path_columns(cur, conn)
+        n_write = _accdb_write_workers(len(rows), write_workers)
+        if n_write > 1:
+            note(
+                f"  AccDB bulk load will use {n_write} parallel ACE processes "
+                f"(set LAN_ACCDB_WRITE_WORKERS to override)"
+            )
 
         existing_log = _read_accdb_ingest_log(cur) if not created_new else []
+
+        def close_odbc() -> None:
+            nonlocal conn, cur
+            if conn is None:
+                return
+            try:
+                conn.commit()
+            except Exception:  # noqa: BLE001
+                pass
+            conn.close()
+            conn = None
+            cur = None
+
+        def reopen_odbc() -> None:
+            nonlocal conn, cur
+            if conn is not None:
+                return
+            conn = _open_accdb(out_path)
+            cur = conn.cursor()
 
         full_rebuild = created_new or (not replace_root) or (not root)
         if full_rebuild:
@@ -2040,8 +2631,27 @@ def write_accdb(
             _drop_accdb_table(cur, conn, "tblFiles")
             _drop_accdb_table(cur, conn, "tblFolderMeta")
             _ensure_accdb_tables(cur, conn, with_indexes=False)
-            _insert_accdb_file_rows(cur, conn, rows, on_progress=on_progress)
-            _insert_folder_meta_rows(cur, conn, rows, on_progress=on_progress)
+            _widen_path_columns(cur, conn)
+            # Release the ODBC handle so DAO can exclusive-lock for Text ISAM import.
+            close_odbc()
+            _insert_accdb_file_rows(
+                None,
+                None,
+                rows,
+                on_progress=on_progress,
+                accdb_path=out_path,
+                write_workers=write_workers,
+            )
+            _insert_folder_meta_rows(
+                None,
+                None,
+                rows,
+                on_progress=on_progress,
+                accdb_path=out_path,
+                write_workers=write_workers,
+            )
+            reopen_odbc()
+            assert conn is not None and cur is not None
             if ingest_log is not None:
                 log_rows = [
                     r for r in ingest_log if not _is_synthetic_ingest_root(r.root_path)
@@ -2065,8 +2675,25 @@ def write_accdb(
             cur, conn, root, on_progress=on_progress
         )
         _delete_folder_meta_under_root(cur, conn, root, on_progress=on_progress)
-        _insert_accdb_file_rows(cur, conn, rows, on_progress=on_progress)
-        _insert_folder_meta_rows(cur, conn, rows, on_progress=on_progress)
+        close_odbc()
+        _insert_accdb_file_rows(
+            None,
+            None,
+            rows,
+            on_progress=on_progress,
+            accdb_path=out_path,
+            write_workers=write_workers,
+        )
+        _insert_folder_meta_rows(
+            None,
+            None,
+            rows,
+            on_progress=on_progress,
+            accdb_path=out_path,
+            write_workers=write_workers,
+        )
+        reopen_odbc()
+        assert conn is not None and cur is not None
         assert new_ingest is not None
         if ingest_log is not None:
             log_rows = [
@@ -2082,7 +2709,8 @@ def write_accdb(
             f"ingest scans now={len(log_rows)} in {time.time() - t0:.1f}s"
         )
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
 
 def pick_folder(title: str = "Select a folder to crawl (LAN Search Tool)") -> str:
@@ -2490,6 +3118,7 @@ def run_interactive(
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     try:
         raise SystemExit(run_interactive())
     except SystemExit:
